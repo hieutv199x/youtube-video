@@ -1,0 +1,20 @@
+Build on Windows locally:
+  1. python -m venv .venv
+  2. .venv\Scripts\activate
+  3. pip install -r requirements.txt pyinstaller
+  4. python build.py --platform windows --onefile   (or omit --onefile)
+
+Artifacts:
+  - Onefile: dist/YouTubeManager.exe
+  - Folder : dist/YouTubeManager/YouTubeManager.exe
+
+Cross-build from macOS is not natively supported. Use GitHub Actions workflow:
+  - Push to main (or run workflow manually)
+  - Download artifacts from Actions tab.
+
+Include client_secret.json at project root before building if OAuth required.
+
+If bundling ffmpeg:
+  - Place binaries, set executable bit
+  - Add paths to FFMPEG_BINARIES list in build.py
+  - In code, ensure PATH includes those (optional).
