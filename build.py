@@ -96,6 +96,9 @@ def build_args(target: str, onefile: bool, debug: bool, console: bool, icon_over
     if fonts_dir.exists():
         for f in fonts_dir.glob("*.ttf"):
             args += ["--add-data", f"{f.name}:fonts"]
+    custom_font = PROJECT_ROOT / "font" / "KeinannPOP.ttf"
+    if custom_font.exists():
+        args += ["--add-data", f"{custom_font.name}:font"]
     args.append(MAIN_ENTRY)
     return args
 

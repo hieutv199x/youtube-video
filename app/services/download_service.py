@@ -10,6 +10,13 @@ import os
 import shutil
 import sys  # ensure present
 import platform
+import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import math
+try:
+    import psutil  # optional
+except Exception:
+    psutil = None
 
 logger = logging.getLogger(__name__)
 
@@ -25,27 +32,51 @@ def get_video_duration(input_path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return float(result.stdout.strip())
 
-def _find_font_file() -> Optional[str]:
-    """Locate a bundled TTF font to avoid fontconfig lookup."""
-    base = _runtime_base_dir()
-    candidates = [
-        base / "vendor" / "fonts" / "DejaVuSans.ttf",
-        base / "fonts" / "DejaVuSans.ttf",
-        base / "vendor" / "fonts" / "Arial.ttf",
-    ]
-    for c in candidates:
-        if c.exists():
-            return str(c)
-    return None
+def break_and_pad(text: str, width: int = 20) -> str:
+    """
+    Break text into lines of max `width` characters,
+    then pad each line with spaces at start and end
+    so all lines are the same length as the longest one.
+    """
+    # Step 1: wrap text
+    lines = textwrap.wrap(text, width=width)
 
-def _escape_drawtext_text(s: str) -> str:
-    return (s.replace("\\", "\\\\")
-             .replace(":", r"\:")
-             .replace("'", r"\'")
-             .replace("[", r"\[")
-             .replace("]", r"\]")
-             .replace(",", r"\,")
-             .replace("=", r"\="))
+    # Step 2: find the longest line length
+    max_len = max(len(line) for line in lines)
+
+    # Step 3: pad each line (left + right)
+    padded_lines = []
+    for line in lines:
+        extra = max_len - len(line)
+        left = extra // 2
+        right = extra - left
+        padded_lines.append(" " * right + line + " " * left)
+
+    return "\n".join(padded_lines)
+
+def _find_font_file() -> Optional[Path]:
+    """
+    Locate the overlay font for both dev and packaged (frozen) builds.
+    Search order:
+      1. Env var YT_FONT_FILE (if set)
+      2. runtime_base_dir()/font/KeinannPOP.ttf (inside packaged app)
+      3. runtime_base_dir()/resources/font/KeinannPOP.ttf
+      4. Original absolute development path
+    """
+    candidates = []
+    env_font = os.environ.get("YT_FONT_FILE")
+    if env_font:
+        candidates.append(Path(env_font))
+    base = _runtime_base_dir()
+    candidates.extend([
+        base / "font" / "KeinannPOP.ttf",
+        base / "resources" / "font" / "KeinannPOP.ttf",
+        Path("/Users/hieutran/Work/Personal/youtube/font/KeinannPOP.ttf"),
+    ])
+    for c in candidates:
+        if c and c.exists():
+            return c
+    return None
 
 def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120,
                          title_prefix="Part", video_title=None, h=1920, w=1080):
@@ -57,22 +88,33 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         # Derive from filename if not provided
         stem = input_path.stem
         video_title = stem.rsplit(" - ", 1)[0] if " - " in stem else stem
-    safe_title = _escape_drawtext_text(video_title)
-    fontfile = _find_font_file()
-    font_arg = f"fontfile='{fontfile}':" if fontfile else ""
+    safe_title = break_and_pad(video_title, 30)  # wrap long titles for overlay
+
+    # Font file integration (prod-aware)
+    font_file = _find_font_file()
+    font_param = ""
+    if font_file:
+        # Escape backslashes and colons for ffmpeg drawtext parser
+        escaped_font_path = str(font_file).replace("\\", "\\\\").replace(":", "\\:")
+        font_param = f"fontfile='{escaped_font_path}'"
+
     num_parts = int(duration // segment_duration) + (1 if duration % segment_duration > 0 else 0)
     segments = []
+
+    # Build task descriptors first
+    tasks = []
     for i in range(num_parts):
         start = i * segment_duration
         out_file = outdir / f"{input_path.stem}_{title_prefix.lower().replace(' ', '_')}{i+1}{input_path.suffix}"
         top_text = f"{title_prefix} {i+1}"
-        top_text_esc = _escape_drawtext_text(top_text)
+        tasks.append((i, start, out_file, top_text))
+
+    def _run_segment(idx, start, out_file, top_text):
         vf = (
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext={font_arg}text='{safe_title}':fontcolor=black:fontsize=36:"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+            f"drawtext={font_param + ':' if font_param else ''}text='{safe_title}':fontcolor=black:fontsize=36:"
             f"x=(w-text_w)/2:y=h/4-text_h:box=1:boxcolor=yellow@1:boxborderw=10,"
-            f"drawtext={font_arg}text='{top_text_esc}':fontcolor=black:fontsize=48:"
+            f"drawtext={font_param + ':' if font_param else ''}text='{top_text}':fontcolor=black:fontsize=48:"
             f"x=(w-text_w)/2:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
         )
         cmd = [
@@ -85,9 +127,35 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
             str(out_file)
         ]
         subprocess.run(cmd, check=True)
-        segments.append(out_file)
-        print(f"Created {out_file}")
-    
+        return idx, out_file
+
+    # Parallel execution
+    max_workers = min(
+        len(tasks),
+        max(1, int(os.environ.get("YT_SPLIT_WORKERS", "4")))
+    )
+    errors = []
+    results = {}
+    if tasks:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_run_segment, idx, start, out_file, top_text): idx
+                for (idx, start, out_file, top_text) in tasks
+            }
+            for fut in as_completed(future_map):
+                try:
+                    idx, produced = fut.result()
+                    results[idx] = produced
+                    print(f"Created {produced}")
+                except Exception as e:
+                    errors.append(e)
+        if errors:
+            # Optionally remove any partially created segments on failure
+            raise RuntimeError(
+                f"One or more segments failed ({len(errors)}/{len(tasks)}). First error: {errors[0]}"
+            )
+        # Preserve original order
+        segments = [results[i] for i in range(len(tasks))]
     return segments
 
 def _runtime_base_dir():
@@ -250,8 +318,7 @@ class DownloadWorker(QThread):
                 downloaded_files = list(outdir.glob(f"*{info['id']}*.{search_ext}")) if info else []
                 if not downloaded_files:
                     # Last resort: any file with the id
-                    if info and 'id' in info:
-                        downloaded_files = list(outdir.glob(f"*{info['id']}*"))
+                    downloaded_files = list(outdir.glob(f"*{info['id']}*"))
                 if not downloaded_files:
                     raise Exception("Downloaded file not found after yt-dlp run.")
                 file_path = downloaded_files[0]
@@ -307,6 +374,47 @@ class DownloadWorker(QThread):
             f"best{constraint}[ext=mp4]/best{constraint}/bv*+ba/b"
         )
 
+def _compute_resource_limits():
+    """
+    Return dict with tuned limits based on CPU cores and (optionally) RAM.
+    Heuristics:
+      - max_concurrent_downloads ~ cores/4 (min 1, max 4; reduced if low RAM)
+      - max_split_workers ~ cores/2 (min 1, max 8; reduced if low RAM)
+    Environment vars (YT_MAX_CONCURRENT / YT_SPLIT_WORKERS) override but are capped by safe maxima.
+    """
+    cores = os.cpu_count() or 2
+    total_gb = None
+    if psutil:
+        try:
+            total_gb = psutil.virtual_memory().total / (1024**3)
+        except Exception:
+            total_gb = None
+
+    # Base recommendations
+    rec_concurrent = min(4, max(1, cores // 4 or 1))
+    rec_split = min(8, max(1, cores // 2 or 1))
+
+    # Adjust for low memory (<4GB => be conservative)
+    if total_gb is not None and total_gb < 4:
+        rec_concurrent = min(rec_concurrent, 1)
+        rec_split = min(rec_split, 2)
+
+    # Apply env overrides (capped)
+    env_concurrent = os.environ.get("YT_MAX_CONCURRENT")
+    if env_concurrent and env_concurrent.isdigit():
+        rec_concurrent = max(1, min(int(env_concurrent), 8))
+
+    env_split = os.environ.get("YT_SPLIT_WORKERS")
+    if env_split and env_split.isdigit():
+        rec_split = max(1, min(int(env_split), 16))
+
+    return {
+        "max_concurrent_downloads": rec_concurrent,
+        "max_split_workers": rec_split,
+        "cores": cores,
+        "total_ram_gb": total_gb
+    }
+
 def _stable_download_dir() -> Path:
     """Return a stable, platform-appropriate download directory."""
     system = platform.system().lower()
@@ -339,14 +447,44 @@ class DownloadService(QObject):
         self.tasks = {}
         self.queue = []  # task ids waiting
         self.max_concurrent = Config.MAX_CONCURRENT_DOWNLOADS
-    
+        self._apply_resource_tuning()
+
+    def _apply_resource_tuning(self):
+        limits = _compute_resource_limits()
+        # Store for inspection
+        self.resource_limits = limits
+        # Override configured max_concurrent only if higher than recommendation
+        if self.max_concurrent > limits["max_concurrent_downloads"]:
+            self.max_concurrent = limits["max_concurrent_downloads"]
+        # Ensure split workers env set (only set if missing)
+        if not os.environ.get("YT_SPLIT_WORKERS"):
+            os.environ["YT_SPLIT_WORKERS"] = str(limits["max_split_workers"])
+        # Soft ceiling for total queued+active tasks (multiplier)
+        self.capacity_task_limit = self.max_concurrent * 5
+        logger.info(
+            f"Resource tuning applied: max_concurrent_downloads={self.max_concurrent}, "
+            f"split_workers={os.environ.get('YT_SPLIT_WORKERS')}, "
+            f"cores={limits['cores']}, ram_gb={limits['total_ram_gb'] or 'unknown'}"
+        )
+
     def add_download_task(self, url: str, task_type: TaskType = TaskType.VIDEO_AUDIO,
                           output_format: Optional[str] = None, should_split: bool = False,
                           segment_duration: int = 120, title_prefix: str = "Part",
                           overlay_title: str | None = None,
-                          resolution: int | None = None,  # legacy height
+                          resolution: int | None = None,
                           resolution_width: int | None = None,
                           resolution_height: int | None = None) -> DownloadTask:
+        # Capacity advisory (does not block, only warns)
+        active_or_queued = sum(
+            1 for t in self.tasks.values()
+            if t.status in (TaskStatus.DOWNLOADING, TaskStatus.PROCESSING, TaskStatus.QUEUED)
+        )
+        if hasattr(self, "capacity_task_limit") and active_or_queued >= self.capacity_task_limit:
+            logger.warning(
+                "High load: active/queued tasks=%s exceed soft capacity=%s. "
+                "Performance may degrade.",
+                active_or_queued, self.capacity_task_limit
+            )
         if resolution and not resolution_height:
             resolution_height = resolution
         task = DownloadTask(
