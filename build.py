@@ -4,6 +4,10 @@ import subprocess
 from pathlib import Path
 import argparse
 import textwrap
+import urllib.request
+import zipfile
+import io
+import os
 
 PROJECT_ROOT = Path(__file__).parent
 DIST_DIR = PROJECT_ROOT / "dist"
@@ -149,10 +153,57 @@ exe = EXE(
     spec_path.write_text(spec_content)
     print(f"Wrote spec: {spec_path}")
 
+def fetch_ffmpeg_windows():
+    """
+    Download a recent static Windows ffmpeg build (if not already present).
+    Source: BtbN GitHub builds (GPL). Adjust if you need LGPL.
+    """
+    target_dir = PROJECT_ROOT / "vendor" / "ffmpeg" / "windows"
+    ffmpeg_exe = target_dir / "ffmpeg.exe"
+    ffprobe_exe = target_dir / "ffprobe.exe"
+    if ffmpeg_exe.exists() and ffprobe_exe.exists():
+        return
+    target_dir.mkdir(parents=True, exist_ok=True)
+    url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
+    print(f"Downloading ffmpeg (Windows) from: {url}")
+    data = urllib.request.urlopen(url, timeout=60).read()
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        # Find /bin/ffmpeg.exe and /bin/ffprobe.exe
+        for name in z.namelist():
+            lower = name.lower()
+            if lower.endswith("/ffmpeg.exe") or lower.endswith("/ffprobe.exe"):
+                with z.open(name) as src, open(target_dir / Path(name).name, "wb") as dst:
+                    dst.write(src.read())
+    print("FFmpeg (Windows) downloaded and extracted.")
+
+def fetch_ffmpeg_macos():
+    """
+    macOS: if user sets AUTO_FFMPEG and no vendor copy, attempt to copy from system (brew).
+    """
+    target_dir = PROJECT_ROOT / "vendor" / "ffmpeg" / "macos"
+    ffmpeg_bin = shutil.which("ffmpeg")
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffmpeg_bin or not ffprobe_bin:
+        return
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for src in (ffmpeg_bin, ffprobe_bin):
+        dst = target_dir / Path(src).name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+
 def main():
     args = parse_cli()
 
     target = args.platform
+
+    auto_flag = os.environ.get("AUTO_FFMPEG") == "1" or "--auto-ffmpeg" in sys.argv
+    if auto_flag:
+        print("Auto ffmpeg fetch enabled.")
+        if target == "windows":
+            fetch_ffmpeg_windows()
+        else:
+            fetch_ffmpeg_macos()
+
     if target == "windows" and sys.platform != "win32":
         warn_cross_windows()
 

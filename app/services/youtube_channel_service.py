@@ -75,6 +75,7 @@ class YouTubeChannelService(QObject):
     channel_videos_loaded = pyqtSignal(str, list)
     multiple_videos_loaded = pyqtSignal(list)  # aggregated: list of video dicts
     error_occurred = pyqtSignal(str)
+    quota_exceeded = pyqtSignal(str, list)  # message, partial video list
 
     def __init__(self):
         super().__init__()
@@ -151,12 +152,15 @@ class YouTubeChannelService(QObject):
         self.auth_changed.emit(True)
 
     def load_subscriptions(self, max_channels: int = 50):
-        if not self._youtube:
+        if not self._creds or not self._creds.valid:
             self.error_occurred.emit("Not authenticated.")
             return
         def _subs():
             subs = []
             token = None
+            # Ensure self._youtube is initialized
+            if not self._youtube:
+                self._youtube = build("youtube", "v3", credentials=self._creds, cache_discovery=False)
             while len(subs) < max_channels:
                 resp = _execute_with_retries(
                     self._youtube.subscriptions().list(
@@ -167,12 +171,13 @@ class YouTubeChannelService(QObject):
                         order="alphabetical"
                     )
                 )
-                for item in resp.get("items", []):
-                    subs.append({
-                        "channel_id": item["snippet"]["resourceId"]["channelId"],
-                        "title": item["snippet"]["title"]
-                    })
-                token = resp.get("nextPageToken")
+                if resp is not None:
+                    for item in resp.get("items", []):
+                        subs.append({
+                            "channel_id": item["snippet"]["resourceId"]["channelId"],
+                            "title": item["snippet"]["title"]
+                        })
+                token = resp.get("nextPageToken") if resp is not None else None
                 if not token:
                     break
             return subs
@@ -208,6 +213,12 @@ class YouTubeChannelService(QObject):
         worker.finished.connect(lambda: self._emit_videos(worker, channel_id))
         worker.start()
 
+    def _emit_videos(self, worker: _Worker, channel_id: str):
+        if worker.error:
+            self.error_occurred.emit(str(worker.error))
+        else:
+            self.channel_videos_loaded.emit(channel_id, worker.result)
+
     # ------------------ NEW HELPER METHODS ------------------
 
     def _batch_resolve_playlists(self, svc, channel_ids: list):
@@ -223,10 +234,11 @@ class YouTubeChannelService(QObject):
                     fields="items(id,contentDetails/relatedPlaylists/uploads)"
                 )
             )
-            for item in resp.get("items", []):
-                cid = item.get("id")
-                uploads = item["contentDetails"]["relatedPlaylists"]["uploads"]
-                self._playlist_cache[cid] = uploads
+            if resp is not None:
+                for item in resp.get("items", []):
+                    cid = item.get("id")
+                    uploads = item["contentDetails"]["relatedPlaylists"]["uploads"]
+                    self._playlist_cache[cid] = uploads
 
     def _search_channel_recent_videos(self, svc, channel_id: str, published_after_iso: str,
                                       max_results: int) -> list:
@@ -249,17 +261,18 @@ class YouTubeChannelService(QObject):
                     fields="items(id/videoId,snippet/publishedAt,snippet/title),nextPageToken"
                 )
             )
-            for item in resp.get("items", []):
-                vid = item["id"]["videoId"]
-                sn = item["snippet"]
-                videos.append({
-                    "video_id": vid,
-                    "title": sn["title"],
-                    "published_at": sn["publishedAt"],
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                    "_channel_id": channel_id
-                })
-            page_token = resp.get("nextPageToken")
+            if resp is not None:
+                for item in resp.get("items", []):
+                    vid = item["id"]["videoId"]
+                    sn = item["snippet"]
+                    videos.append({
+                        "video_id": vid,
+                        "title": sn["title"],
+                        "published_at": sn["publishedAt"],
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "_channel_id": channel_id
+                    })
+            page_token = resp.get("nextPageToken") if resp is not None else None
             if not page_token:
                 break
         return videos
@@ -280,89 +293,98 @@ class YouTubeChannelService(QObject):
                 )
             )
             page_oldest = True  # assume until we see a newer one
-            for it in resp.get("items", []):
-                sn = it["snippet"]
-                pub = sn["publishedAt"]
-                if pub <= published_after_iso:
-                    # older than cutoff; skip but can consider stopping if many older
-                    continue
-                page_oldest = False
-                vid = sn["resourceId"]["videoId"]
-                videos.append({
-                    "video_id": vid,
-                    "title": sn["title"],
-                    "published_at": pub,
-                    "url": f"https://www.youtube.com/watch?v={vid}",
-                    "_channel_id": channel_id
-                })
-                if len(videos) >= max_results:
-                    break
+            if resp is not None:
+                for it in resp.get("items", []):
+                    sn = it["snippet"]
+                    pub = sn["publishedAt"]
+                    if pub <= published_after_iso:
+                        # older than cutoff; skip but can consider stopping if many older
+                        continue
+                    page_oldest = False
+                    vid = sn["resourceId"]["videoId"]
+                    videos.append({
+                        "video_id": vid,
+                        "title": sn["title"],
+                        "published_at": pub,
+                        "url": f"https://www.youtube.com/watch?v={vid}",
+                        "_channel_id": channel_id
+                    })
+                    if len(videos) >= max_results:
+                        break
             if len(videos) >= max_results:
                 break
-            page_token = resp.get("nextPageToken")
+            page_token = resp.get("nextPageToken") if resp is not None else None
             if not page_token or page_oldest:
                 break
         return videos
 
     # ------------------ MODIFIED: load_multiple_channels_videos ------------------
     def load_multiple_channels_videos(self, channel_ids: list, max_results: int, since_hours: int,
-                                      use_search_strategy: bool = True):
+                                      use_search_strategy: bool = True, channel_limit: int | None = None):
         """Aggregate newest videos across channels efficiently."""
         if not self._creds:
             self.error_occurred.emit("Not authenticated.")
             return
+        if channel_limit:
+            channel_ids = channel_ids[:channel_limit]
 
         def _agg():
             svc = build("youtube", "v3", credentials=self._creds, cache_discovery=False)
             published_after = _iso_time_hours_ago(since_hours)
             all_vids = []
-
-            if not use_search_strategy:
-                # Ensure playlists resolved if we will use playlist method
-                self._batch_resolve_playlists(svc, channel_ids)
-
+            quota_hit = False
+            quota_msg = ""
             for cid in channel_ids:
+                if quota_hit:
+                    break
                 try:
                     channel_videos = []
                     if use_search_strategy:
-                        # Fast path
                         channel_videos = self._search_channel_recent_videos(svc, cid, published_after, max_results)
-                        # Fallback if nothing returned (rare or search disabled)
                         if not channel_videos:
-                            # Resolve playlist if not cached
                             self._batch_resolve_playlists(svc, [cid])
-                            pl_id = self._playlist_cache.get(cid)
-                            if pl_id:
-                                channel_videos = self._playlist_recent_videos(
-                                    svc, pl_id, cid, published_after, max_results
-                                )
+                            pl = self._playlist_cache.get(cid)
+                            if pl:
+                                channel_videos = self._playlist_recent_videos(svc, pl, cid, published_after, max_results)
                     else:
-                        # Playlist path only
                         self._batch_resolve_playlists(svc, [cid])
-                        pl_id = self._playlist_cache.get(cid)
-                        if pl_id:
-                            channel_videos = self._playlist_recent_videos(
-                                svc, pl_id, cid, published_after, max_results
-                            )
+                        pl = self._playlist_cache.get(cid)
+                        if pl:
+                            channel_videos = self._playlist_recent_videos(svc, pl, cid, published_after, max_results)
                     all_vids.extend(channel_videos)
-                except Exception:
-                    # Skip problematic channel, continue others
+                except Exception as e:
+                    emsg = str(e)
+                    if "quotaExceeded" in emsg or "quotaexceeded" in emsg.lower():
+                        quota_hit = True
+                        quota_msg = "YouTube Data API quota exceeded. Partial results shown."
+                        break
+                    # ignore other per-channel errors
                     continue
-            return all_vids
+            return {"videos": all_vids, "quota_hit": quota_hit, "quota_msg": quota_msg}
 
         worker = _Worker(_agg)
-        worker.finished.connect(lambda: self._emit_multiple(worker))
+        worker.finished.connect(lambda: self._emit_multiple_with_quota(worker))
         worker.start()
 
-    # ------------------ Ensure emit helpers exist (single & multi) ------------------
-    def _emit_videos(self, worker: _Worker, channel_id: str):
+    def _emit_multiple_with_quota(self, worker: '_Worker'):
         if worker.error:
+            # propagate as normal error
             self.error_occurred.emit(str(worker.error))
+            return
+        data = worker.result or {}
+        vids = data.get("videos", [])
+        if data.get("quota_hit"):
+            self.quota_exceeded.emit(data.get("quota_msg", "Quota exceeded"), vids)
         else:
-            self.channel_videos_loaded.emit(channel_id, worker.result)
+            self.multiple_videos_loaded.emit(vids)
 
-    def _emit_multiple(self, worker: _Worker):
-        if worker.error:
-            self.error_occurred.emit(str(worker.error))
-        else:
-            self.multiple_videos_loaded.emit(worker.result)
+    # NOTE: quota helper (informational only; API does not expose remaining quota)
+    @staticmethod
+    def estimate_quota_units(channel_count, use_search_strategy):
+        """
+        Rough quota estimate:
+          search.list cost ~100 units per channel (part=snippet).
+          playlist path: channels.list(contentDetails) ~1 + first playlistItems.list page ~1 ≈2 units/channel.
+        """
+        per = 100 if use_search_strategy else 2
+        return channel_count * per

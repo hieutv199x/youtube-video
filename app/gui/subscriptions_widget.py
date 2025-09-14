@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
                              QHBoxLayout, QTableWidget, QTableWidgetItem,
                              QSplitter, QAbstractItemView, QHeaderView, QSpinBox,
                              QDialog, QDialogButtonBox, QLineEdit, QCheckBox, QFormLayout,
-                             QSizePolicy)
+                             QSizePolicy, QMessageBox)  # added QMessageBox
 from PyQt6.QtCore import Qt
 from app.services.youtube_channel_service import YouTubeChannelService
 from app.models.download_task import TaskType, TaskStatus  # added TaskStatus
@@ -120,6 +120,9 @@ class SubscriptionsWidget(QWidget):
         self.since_hours = QSpinBox()
         self.since_hours.setRange(1, 720)
         self.since_hours.setValue(72)
+        self.channel_limit = QSpinBox()
+        self.channel_limit.setRange(0, 1000)
+        self.channel_limit.setValue(0)  # 0 = all
         top.addWidget(self.auth_btn)
         top.addWidget(self.refresh_subs_btn)
         top.addWidget(self.load_all_btn)
@@ -128,7 +131,14 @@ class SubscriptionsWidget(QWidget):
         top.addWidget(self.max_results)
         top.addWidget(QLabel("Since (h):"))
         top.addWidget(self.since_hours)
+        top.addWidget(QLabel("Channel limit:"))
+        top.addWidget(self.channel_limit)
         top.addStretch()
+
+        self.low_quota_checkbox = QCheckBox("Low quota mode")
+        self.low_quota_checkbox.setToolTip("Uses playlistItems (≈2 units/channel) instead of search (≈100 units/channel).")
+        top.addWidget(self.low_quota_checkbox)
+
         layout.addLayout(top)
 
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -136,24 +146,29 @@ class SubscriptionsWidget(QWidget):
         self.subs_table = QTableWidget(0, 2)
         self.subs_table.setHorizontalHeaderLabels(["Channel Title", "Channel ID"])
         self.subs_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.subs_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.subs_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header = self.subs_table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
 
         # Videos table now 5 columns: Published, Channel, Title, URL, Action
         self.videos_table = QTableWidget(0, 5)
         self.videos_table.setHorizontalHeaderLabels(["Published", "Channel", "Title", "URL", ""])
         self.videos_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.videos_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.videos_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.videos_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.videos_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.videos_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header = self.videos_table.horizontalHeader()
+        if header is not None:
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
 
         splitter.addWidget(self.subs_table)
         splitter.addWidget(self.videos_table)
         layout.addWidget(splitter)
 
         self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
         self.setLayout(layout)
 
@@ -169,6 +184,7 @@ class SubscriptionsWidget(QWidget):
         self.svc.channel_videos_loaded.connect(self._on_videos_loaded)
         self.svc.multiple_videos_loaded.connect(self._on_all_videos_loaded)
         self.svc.error_occurred.connect(self._on_error)
+        self.svc.quota_exceeded.connect(self._on_quota_exceeded)
         if self.download_service:
             self.download_service.task_updated.connect(self._on_task_update)
 
@@ -213,7 +229,11 @@ class SubscriptionsWidget(QWidget):
         if not sel:
             return
         row = self.subs_table.currentRow()
-        channel_id = self.subs_table.item(row, 1).text()
+        item = self.subs_table.item(row, 1)
+        if item is None:
+            self.status_label.setText("Error: No channel selected.")
+            return
+        channel_id = item.text()
         self.status_label.setText(f"Loading videos for {channel_id}...")
         self.svc.load_channel_videos(
             channel_id,
@@ -224,13 +244,46 @@ class SubscriptionsWidget(QWidget):
     def _load_all_channels_videos(self):
         if not self._subs:
             return
-        self._all_mode = True
-        self.status_label.setText("Loading newest videos from all channels (sequential)...")
         channel_ids = [c["channel_id"] for c in self._subs]
+        # Respect channel limit preview
+        limit = self.channel_limit.value() or None
+        effective_ids = channel_ids[:limit] if limit else channel_ids
+        use_search = not self.low_quota_checkbox.isChecked()
+        # Quota estimate
+        try:
+            # Estimate quota units locally since import failed
+            def estimate_quota_units(channel_count, use_search):
+                # Example logic: search uses 100 units/channel, playlist uses 2 units/channel
+                return channel_count * (100 if use_search else 2)
+            estimated = estimate_quota_units(len(effective_ids), use_search)
+        except Exception:
+            estimated = None
+        if estimated:
+            self.status_label.setText(f"Estimated quota cost: {estimated} unit(s). Starting fetch...")
+            # Ask confirmation if high
+            if estimated >= 5000:
+                resp = QMessageBox.question(
+                    self,
+                    "High Quota Usage",
+                    f"This request may consume about {estimated} quota units.\n"
+                    f"Daily quota is typically 10,000.\n\nProceed?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No
+                )
+                if resp != QMessageBox.StandardButton.Yes:
+                    self.status_label.setText("Cancelled by user (quota warning).")
+                    return
+        self._all_mode = True
+        self.status_label.setText(
+            f"Loading newest videos from {len(effective_ids)} channel(s) "
+            f"({'search' if use_search else 'playlist'} strategy)..."
+        )
         self.svc.load_multiple_channels_videos(
-            channel_ids,
+            effective_ids,
             max_results=self.max_results.value(),
-            since_hours=self.since_hours.value()
+            since_hours=self.since_hours.value(),
+            channel_limit=None,           # already sliced
+            use_search_strategy=use_search
         )
 
     def _on_videos_loaded(self, channel_id: str, videos: list):
@@ -327,7 +380,8 @@ class SubscriptionsWidget(QWidget):
             return
 
         # Base defaults from main window options provider (if available)
-        base_opts = self.options_provider() if callable(self.options_provider) else {}
+        opts = self.options_provider() if callable(self.options_provider) else {}
+        base_opts = opts if isinstance(opts, dict) else {}
         dlg = SplitOptionsDialog(self, defaults=base_opts, video_title=video.get("title", ""))
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -371,3 +425,13 @@ class SubscriptionsWidget(QWidget):
             self.status_label.setText(f"Error: {msg}")
         else:
             print(f"Error: {msg}")
+
+    def _on_quota_exceeded(self, message: str, partial_videos: list):
+        # Display partial videos (if any) and show message
+        for v in partial_videos:
+            title_lookup = next((c["title"] for c in self._subs if c["channel_id"] == v.get("_channel_id")), v.get("_channel_id"))
+            v["_channel_title"] = title_lookup
+        self._all_mode = False
+        if partial_videos:
+            self._display_videos(partial_videos, aggregated=True)
+        self.status_label.setText(message + (" - Shown partial results." if partial_videos else ""))

@@ -10,9 +10,22 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PIP_NO_PYTHON_VERSION_WARNING: "1"
+      AUTO_FFMPEG: "1"  # triggers automatic ffmpeg bundling in build.py
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+            path: |
+              ~/.cache/pip
+            key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+            restore-keys: |
+              ${{ runner.os }}-pip-
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -22,15 +35,15 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-            pip install -r requirements.txt pyinstaller
+          pip install -r requirements.txt pyinstaller
 
       - name: Build (folder)
         run: |
-          python build.py --platform windows
+          python build.py --platform windows --auto-ffmpeg
 
       - name: Build (onefile)
         run: |
-          python build.py --platform windows --onefile --no-clean
+          python build.py --platform windows --onefile --no-clean --auto-ffmpeg
 
       - name: Archive artifacts (folder)
         uses: actions/upload-artifact@v4

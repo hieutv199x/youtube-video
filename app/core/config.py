@@ -1,6 +1,6 @@
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import json
 
 @dataclass
@@ -25,7 +25,7 @@ class Config:
     THEME: str = "dark"
     
     @classmethod
-    def load_from_file(cls, config_path: Path = None) -> 'Config':
+    def load_from_file(cls, config_path: Optional[Path] = None) -> 'Config':
         """Load configuration from JSON file."""
         if config_path is None:
             config_path = cls.CONFIG_DIR / "settings.json"
@@ -39,7 +39,7 @@ class Config:
                         setattr(cls, key, value)
         return cls()
     
-    def save_to_file(self, config_path: Path = None):
+    def save_to_file(self, config_path: Optional[Path] = None):
         """Save current configuration to JSON file."""
         if config_path is None:
             config_path = self.CONFIG_DIR / "settings.json"

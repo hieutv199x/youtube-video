@@ -20,7 +20,7 @@ def get_runtime_base_dir() -> Path:
     Returns the base directory both in dev and when frozen by PyInstaller.
     """
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS)
+        return Path(getattr(sys, "_MEIPASS", ""))
     return Path(__file__).resolve().parent.parent.parent
 
 class MainWindow(QMainWindow):

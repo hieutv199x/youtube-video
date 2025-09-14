@@ -8,7 +8,7 @@ from app.models.download_task import DownloadTask, TaskStatus, TaskType
 from app.core.config import Config
 import os
 import shutil
-import sys
+import sys  # ensure present
 import platform
 
 logger = logging.getLogger(__name__)
@@ -67,7 +67,7 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
 def _runtime_base_dir():
     """Return base dir in dev or frozen mode."""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS)
+        return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent.parent))
     return Path(__file__).resolve().parent.parent.parent
 
 def _candidate_ffmpeg_paths():
@@ -115,6 +115,10 @@ def _locate_ffmpeg() -> tuple[Optional[str], Optional[str], Optional[str]]:
         return found_ffmpeg, found_ffprobe, str(Path(found_ffmpeg).parent)
     return None, None, None
 
+def _ffmpeg_available():
+    f, p, _ = _locate_ffmpeg()
+    return bool(f and p)
+
 class DownloadWorker(QThread):
     """Worker thread for downloading videos."""
     
@@ -139,14 +143,13 @@ class DownloadWorker(QThread):
                 return
             self.status_changed.emit(self.task.id, TaskStatus.DOWNLOADING)
 
-            # Always attempt to resolve ffmpeg early
             ffmpeg_path, ffprobe_path, ffmpeg_dir = _locate_ffmpeg()
+            has_ffmpeg = bool(ffmpeg_path and ffprobe_path)
 
-            # Pre-fetch metadata FIRST so title is known even if we later error out
+            # Pre-fetch metadata for title (safe even without ffmpeg)
             preliminary_opts = {
                 'quiet': True,
                 'skip_download': True,
-                'nocheckcertificate': True,
                 'ignoreerrors': False,
             }
             try:
@@ -154,20 +157,25 @@ class DownloadWorker(QThread):
                     info = meta_ydl.extract_info(self.task.url, download=False)
                     if info:
                         self.task.title = info.get('title') or self.task.title
-            except Exception as meta_err:
-                # Non-fatal for now; continue – title may remain Unknown
-                logger.debug(f"Metadata pre-fetch failed: {meta_err}")
+            except Exception:
+                pass  # keep going
 
-            needs_video_processing = (self.task.task_type != TaskType.AUDIO_ONLY) or self.task.should_split
-            if needs_video_processing and (not ffmpeg_path or not ffprobe_path):
-                # Provide explicit failure early (better UX)
-                raise RuntimeError(
-                    "FFmpeg not found. Install ffmpeg (and ffprobe) or bundle them.\n"
-                    "macOS (brew): brew install ffmpeg\n"
-                    "Windows (scoop): scoop install ffmpeg\n"
-                    "Or place binaries in vendor/ffmpeg/<platform>/ before building.\n"
-                    "Splitting / muxing requires ffmpeg."
-                )
+            splitting_required = self.task.should_split
+            video_processing_required = (self.task.task_type != TaskType.AUDIO_ONLY)
+
+            # Fallback mode: allow simple progressive download if only merge was needed
+            fallback_no_ffmpeg = (
+                not has_ffmpeg
+                and video_processing_required
+                and not splitting_required
+                and self.task.task_type == TaskType.VIDEO_AUDIO
+            )
+
+            if not has_ffmpeg and not fallback_no_ffmpeg:
+                if video_processing_required or splitting_required:
+                    raise RuntimeError(
+                        "FFmpeg not found. Required for this operation (video muxing / splitting)."
+                    )
 
             if ffmpeg_dir:
                 os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
@@ -189,16 +197,21 @@ class DownloadWorker(QThread):
                     eta_str = f"{eta}s" if eta else "Unknown"
                     self.progress_updated.emit(self.task.id, progress, speed_str, eta_str)
 
-            format_selector = self._get_format_selector()
+            # Determine format selector (may override for fallback)
+            if fallback_no_ffmpeg:
+                # Use a single progressive format (no separate A/V -> no merge)
+                format_selector = "best[ext=mp4]/best"
+            else:
+                format_selector = self._get_format_selector()
 
             ydl_opts = {
                 'outtmpl': str(outdir / '%(title)s - %(id)s.%(ext)s'),
                 'format': format_selector,
-                'merge_output_format': self.task.output_format,
+                'merge_output_format': None if fallback_no_ffmpeg else self.task.output_format,
                 'progress_hooks': [progress_hook],
                 'ignoreerrors': False,
             }
-            if ffmpeg_dir:
+            if ffmpeg_dir and has_ffmpeg:
                 ydl_opts['ffmpeg_location'] = ffmpeg_dir
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -206,13 +219,21 @@ class DownloadWorker(QThread):
                 if info and not self.task.title:
                     self.task.title = info.get('title') or self.task.title
 
-                downloaded_files = list(outdir.glob(f"*{info['id']}*.{self.task.output_format}")) if info else []
+                # Try both output_format and mp4 when fallback used
+                search_ext = self.task.output_format if not fallback_no_ffmpeg else "mp4"
+                downloaded_files = list(outdir.glob(f"*{info['id']}*.{search_ext}")) if info else []
+                if not downloaded_files:
+                    # Last resort: any file with the id
+                    if info and 'id' in info:
+                        downloaded_files = list(outdir.glob(f"*{info['id']}*"))
                 if not downloaded_files:
                     raise Exception("Downloaded file not found after yt-dlp run.")
                 file_path = downloaded_files[0]
                 segments = []
 
                 if self.task.should_split:
+                    if not has_ffmpeg:
+                        raise RuntimeError("Splitting requested but ffmpeg is not available.")
                     self.status_changed.emit(self.task.id, TaskStatus.PROCESSING)
                     try:
                         segments = split_and_mark_video(
@@ -232,8 +253,8 @@ class DownloadWorker(QThread):
             msg = str(e)
             if "ffmpeg" in msg.lower():
                 msg += (
-                    "\nHint: Provide ffmpeg & ffprobe via system PATH or bundle static binaries "
-                    "in vendor/ffmpeg/<platform>/ (ffmpeg, ffprobe) before building."
+                    "\nHint: Add ffmpeg & ffprobe to PATH or bundle them under vendor/ffmpeg/<platform>/."
+                    "\n(Automatic fallback used only for simple non-split progressive downloads.)"
                 )
             logger.error(f"Download failed for task {self.task.id}: {msg}")
             self.error_occurred.emit(self.task.id, msg)
@@ -294,7 +315,7 @@ class DownloadService(QObject):
         self.max_concurrent = Config.MAX_CONCURRENT_DOWNLOADS
     
     def add_download_task(self, url: str, task_type: TaskType = TaskType.VIDEO_AUDIO,
-                          output_format: str = None, should_split: bool = False,
+                          output_format: Optional[str] = None, should_split: bool = False,
                           segment_duration: int = 120, title_prefix: str = "Part",
                           overlay_title: str | None = None,
                           resolution: int | None = None,  # legacy height
@@ -395,7 +416,7 @@ class DownloadService(QObject):
             task.error_message = error_message
             self.task_updated.emit(task)
     
-    def _on_download_completed(self, task_id: str, file_path: str, segments: list = None):
+    def _on_download_completed(self, task_id: str, file_path: str, segments: Optional[list] = None):
         """Handle download completion."""
         if task_id in self.tasks:
             task = self.tasks[task_id]
