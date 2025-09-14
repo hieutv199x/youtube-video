@@ -187,6 +187,12 @@ class SubscriptionsWidget(QWidget):
         self.svc.quota_exceeded.connect(self._on_quota_exceeded)
         if self.download_service:
             self.download_service.task_updated.connect(self._on_task_update)
+        # NEW: attempt silent authentication reuse
+        if self.svc.ensure_session():
+            # Automatically load subscriptions after silent auth
+            self.refresh_subs_btn.setEnabled(True)
+            self.load_all_btn.setEnabled(True)
+            self._load_subs()
 
     def _on_auth_clicked(self):
         """Handle authenticate button click."""
@@ -238,14 +244,16 @@ class SubscriptionsWidget(QWidget):
         self.svc.load_channel_videos(
             channel_id,
             max_results=self.max_results.value(),
-            since_hours=self.since_hours.value()
+            since_hours=self.since_hours.value(),
+            use_cache=False,      # force fresh
+            force=True,           # bypass cached file even if present
+            use_search_fallback=not self.low_quota_checkbox.isChecked()
         )
 
     def _load_all_channels_videos(self):
         if not self._subs:
             return
         channel_ids = [c["channel_id"] for c in self._subs]
-        # Respect channel limit preview
         limit = self.channel_limit.value() or None
         effective_ids = channel_ids[:limit] if limit else channel_ids
         use_search = not self.low_quota_checkbox.isChecked()
@@ -282,8 +290,9 @@ class SubscriptionsWidget(QWidget):
             effective_ids,
             max_results=self.max_results.value(),
             since_hours=self.since_hours.value(),
-            channel_limit=None,           # already sliced
-            use_search_strategy=use_search
+            channel_limit=None,
+            use_search_strategy=use_search,
+            use_cache=False       # always fresh
         )
 
     def _on_videos_loaded(self, channel_id: str, videos: list):

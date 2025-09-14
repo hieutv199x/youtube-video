@@ -25,6 +25,28 @@ def get_video_duration(input_path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return float(result.stdout.strip())
 
+def _find_font_file() -> Optional[str]:
+    """Locate a bundled TTF font to avoid fontconfig lookup."""
+    base = _runtime_base_dir()
+    candidates = [
+        base / "vendor" / "fonts" / "DejaVuSans.ttf",
+        base / "fonts" / "DejaVuSans.ttf",
+        base / "vendor" / "fonts" / "Arial.ttf",
+    ]
+    for c in candidates:
+        if c.exists():
+            return str(c)
+    return None
+
+def _escape_drawtext_text(s: str) -> str:
+    return (s.replace("\\", "\\\\")
+             .replace(":", r"\:")
+             .replace("'", r"\'")
+             .replace("[", r"\[")
+             .replace("]", r"\]")
+             .replace(",", r"\,")
+             .replace("=", r"\="))
+
 def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120,
                          title_prefix="Part", video_title=None, h=1920, w=1080):
     """Split video into segments and overlay part label (top) and full video title (bottom)."""
@@ -35,18 +57,22 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         # Derive from filename if not provided
         stem = input_path.stem
         video_title = stem.rsplit(" - ", 1)[0] if " - " in stem else stem
-    safe_title = video_title.replace("\\", "\\\\").replace(":", r'\:').replace("'", r"\'")
+    safe_title = _escape_drawtext_text(video_title)
+    fontfile = _find_font_file()
+    font_arg = f"fontfile='{fontfile}':" if fontfile else ""
     num_parts = int(duration // segment_duration) + (1 if duration % segment_duration > 0 else 0)
     segments = []
     for i in range(num_parts):
         start = i * segment_duration
         out_file = outdir / f"{input_path.stem}_{title_prefix.lower().replace(' ', '_')}{i+1}{input_path.suffix}"
         top_text = f"{title_prefix} {i+1}"
+        top_text_esc = _escape_drawtext_text(top_text)
         vf = (
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext=text='{safe_title}':fontcolor=black:fontsize=36:"
+            f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
+            f"drawtext={font_arg}text='{safe_title}':fontcolor=black:fontsize=36:"
             f"x=(w-text_w)/2:y=h/4-text_h:box=1:boxcolor=yellow@1:boxborderw=10,"
-            f"drawtext=text='{top_text}':fontcolor=black:fontsize=48:"
+            f"drawtext={font_arg}text='{top_text_esc}':fontcolor=black:fontsize=48:"
             f"x=(w-text_w)/2:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
         )
         cmd = [

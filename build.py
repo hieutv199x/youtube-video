@@ -91,6 +91,11 @@ def build_args(target: str, onefile: bool, debug: bool, console: bool, icon_over
         icon = ICON_WIN if target == "windows" else ICON_MAC
         if (PROJECT_ROOT / icon).exists():
             args += ["--icon", icon]
+    # Add font files
+    fonts_dir = PROJECT_ROOT / "vendor" / "fonts"
+    if fonts_dir.exists():
+        for f in fonts_dir.glob("*.ttf"):
+            args += ["--add-data", f"{f.name}:fonts"]
     args.append(MAIN_ENTRY)
     return args
 
