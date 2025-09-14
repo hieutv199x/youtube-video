@@ -115,6 +115,8 @@ def parse_cli():
     ap.add_argument("--icon", help="Override icon path (relative)")
     ap.add_argument("--no-clean", action="store_true", help="Skip cleanup of dist/build")
     ap.add_argument("--spec-out", help="Write generated spec to this path then exit")
+    ap.add_argument("--auto-ffmpeg", action="store_true",
+                    help="Fetch/copy ffmpeg & ffprobe into vendor/ffmpeg/<platform>/ before build")
     return ap.parse_args()
 
 def write_spec(spec_path: Path, pyinstaller_cmd_line: list[str]):
@@ -158,23 +160,22 @@ def fetch_ffmpeg_windows():
     Download a recent static Windows ffmpeg build (if not already present).
     Source: BtbN GitHub builds (GPL). Adjust if you need LGPL.
     """
+    url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
     target_dir = PROJECT_ROOT / "vendor" / "ffmpeg" / "windows"
     ffmpeg_exe = target_dir / "ffmpeg.exe"
     ffprobe_exe = target_dir / "ffprobe.exe"
     if ffmpeg_exe.exists() and ffprobe_exe.exists():
         return
     target_dir.mkdir(parents=True, exist_ok=True)
-    url = "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip"
     print(f"Downloading ffmpeg (Windows) from: {url}")
     data = urllib.request.urlopen(url, timeout=60).read()
     with zipfile.ZipFile(io.BytesIO(data)) as z:
-        # Find /bin/ffmpeg.exe and /bin/ffprobe.exe
         for name in z.namelist():
             lower = name.lower()
             if lower.endswith("/ffmpeg.exe") or lower.endswith("/ffprobe.exe"):
                 with z.open(name) as src, open(target_dir / Path(name).name, "wb") as dst:
                     dst.write(src.read())
-    print("FFmpeg (Windows) downloaded and extracted.")
+    print("FFmpeg (Windows) downloaded.")
 
 def fetch_ffmpeg_macos():
     """
@@ -196,7 +197,7 @@ def main():
 
     target = args.platform
 
-    auto_flag = os.environ.get("AUTO_FFMPEG") == "1" or "--auto-ffmpeg" in sys.argv
+    auto_flag = args.auto_ffmpeg or os.environ.get("AUTO_FFMPEG") == "1"
     if auto_flag:
         print("Auto ffmpeg fetch enabled.")
         if target == "windows":
