@@ -60,6 +60,15 @@ def _auto_ffmpeg_for_platform(target: str):
             added.append(brew_ffprobe)
     return added
 
+def _pkg_spec(src: str | Path, dest: str) -> str:
+    """
+    Build a PyInstaller --add-data/--add-binary spec string with the correct
+    separator for the current build platform (not the target platform).
+    Windows requires ';' while Unix uses ':'.
+    """
+    sep = ';' if os.name == 'nt' else ':'
+    return f"{src}{sep}{dest}"
+
 def build_args(target: str, onefile: bool, debug: bool, console: bool, icon_override: str | None):
     args = [
         "--noconfirm",
@@ -74,15 +83,15 @@ def build_args(target: str, onefile: bool, debug: bool, console: bool, icon_over
         args.append("--debug=all")
     secret = PROJECT_ROOT / "client_secret.json"
     if secret.exists():
-        args += ["--add-data", f"{secret.name}:."]  # relative inside app
+        args += ["--add-data", _pkg_spec(secret.name, ".")]
     for bin_path in FFMPEG_BINARIES:
         bp = Path(bin_path)
         if bp.exists():
-            args += ["--add-binary", f"{bin_path}:."]
+            args += ["--add-binary", _pkg_spec(bin_path, ".")]
     # Auto-add ffmpeg binaries if found
     auto_bins = _auto_ffmpeg_for_platform(target)
     for b in auto_bins:
-        args += ["--add-binary", f"{b}:."]
+        args += ["--add-binary", _pkg_spec(b, ".")]
     if icon_override:
         icon_path = PROJECT_ROOT / icon_override
         if icon_path.exists():
@@ -95,10 +104,12 @@ def build_args(target: str, onefile: bool, debug: bool, console: bool, icon_over
     fonts_dir = PROJECT_ROOT / "vendor" / "fonts"
     if fonts_dir.exists():
         for f in fonts_dir.glob("*.ttf"):
-            args += ["--add-data", f"{f.name}:fonts"]
+            rel = f.relative_to(PROJECT_ROOT)
+            args += ["--add-data", _pkg_spec(rel, "fonts")]
     custom_font = PROJECT_ROOT / "font" / "KeinannPOP.ttf"
     if custom_font.exists():
-        args += ["--add-data", f"{custom_font.name}:font"]
+        rel_font = custom_font.relative_to(PROJECT_ROOT)
+        args += ["--add-data", _pkg_spec(rel_font, "font")]
     args.append(MAIN_ENTRY)
     return args
 
