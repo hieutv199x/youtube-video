@@ -2,14 +2,17 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
                              QHBoxLayout, QTableWidget, QTableWidgetItem,
                              QSplitter, QAbstractItemView, QHeaderView, QSpinBox,
                              QDialog, QDialogButtonBox, QLineEdit, QCheckBox, QFormLayout,
-                             QSizePolicy, QMessageBox)  # added QMessageBox
-from PyQt6.QtCore import Qt
+                             QSizePolicy, QMessageBox, QFileDialog, QInputDialog)
+from PyQt6.QtCore import Qt, QSettings
+import os
+from pathlib import Path
 from app.services.youtube_channel_service import YouTubeChannelService
-from app.models.download_task import TaskType, TaskStatus  # added TaskStatus
+from app.models.download_task import TaskType, TaskStatus
+from app.core.config import Config
 
 class SplitOptionsDialog(QDialog):
     """Dialog to collect per-download split options."""
-    def __init__(self, parent=None, defaults=None, video_title: str = ""):
+    def __init__(self, parent=None, defaults=None, video_title: str = "", initial_download_dir: str | None = None):
         super().__init__(parent)
         self.setWindowTitle("Download Options")
         self.setSizeGripEnabled(True)             # allow manual resize
@@ -51,6 +54,23 @@ class SplitOptionsDialog(QDialog):
                 self.resolution_edit.setText(str(rh))
         form.addRow("Resolution:", self.resolution_edit)
 
+        # Download folder selector (new)
+        folder_layout = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setPlaceholderText("Select download folder...")
+        if initial_download_dir:
+            self.folder_edit.setText(initial_download_dir)
+        browse_btn = QPushButton("Browse...")
+        def _browse():
+            start_dir = self.folder_edit.text().strip() or initial_download_dir or str(Path.home())
+            picked = QFileDialog.getExistingDirectory(self, "Select Download Folder", start_dir)
+            if picked:
+                self.folder_edit.setText(picked)
+        browse_btn.clicked.connect(_browse)
+        folder_layout.addWidget(self.folder_edit)
+        folder_layout.addWidget(browse_btn)
+        form.addRow("Download folder:", folder_layout)
+
         # Enable/disable controls based on split checkbox
         def toggle(enabled):
             self.duration_spin.setEnabled(enabled)
@@ -86,6 +106,7 @@ class SplitOptionsDialog(QDialog):
             rh = int(spec)
         vals["resolution_width"] = rw
         vals["resolution_height"] = rh
+        vals["download_dir"] = self.folder_edit.text().strip()
         return vals
 
 class SubscriptionsWidget(QWidget):
@@ -101,6 +122,7 @@ class SubscriptionsWidget(QWidget):
         self._pending_channels = 0
         self._processed_channels = 0
         self._download_buttons = {}  # url -> QPushButton
+        self._last_download_dir = QSettings().value("last_download_dir", str(getattr(Config, "DOWNLOADS_DIR", Path.home())))
         self._build_ui()
         self._wire()
 
@@ -391,12 +413,28 @@ class SubscriptionsWidget(QWidget):
         # Base defaults from main window options provider (if available)
         opts = self.options_provider() if callable(self.options_provider) else {}
         base_opts = opts if isinstance(opts, dict) else {}
-        dlg = SplitOptionsDialog(self, defaults=base_opts, video_title=video.get("title", ""))
+        dlg = SplitOptionsDialog(
+            self,
+            defaults=base_opts,
+            video_title=video.get("title", ""),
+            initial_download_dir=self._last_download_dir
+        )
 
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self.status_label.setText("Download cancelled.")
             return
         user_opts = dlg.get_values()
+        folder = user_opts.get("download_dir") or self._last_download_dir
+        if not folder:
+            self.status_label.setText("Download cancelled (no folder).")
+            return
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception as e:
+            QMessageBox.warning(self, "Folder Error", f"Cannot create/use folder:\n{folder}\n\n{e}")
+            return
+        self._last_download_dir = folder
+        QSettings().setValue("last_download_dir", folder)
 
         task = self.download_service.add_download_task(
             url=video["url"],
@@ -407,7 +445,8 @@ class SubscriptionsWidget(QWidget):
             title_prefix=user_opts["title_prefix"],
             overlay_title=user_opts["overlay_title"] or video.get("title", ""),
             resolution_width=user_opts["resolution_width"] if user_opts["resolution_width"] is not None else base_opts.get("resolution_width"),
-            resolution_height=user_opts["resolution_height"] if user_opts["resolution_height"] is not None else base_opts.get("resolution_height")
+            resolution_height=user_opts["resolution_height"] if user_opts["resolution_height"] is not None else base_opts.get("resolution_height"),
+            download_dir=folder
         )
         self.download_service.start_download(task.id)
         btn = self._download_buttons.get(video["url"])

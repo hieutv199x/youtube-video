@@ -29,8 +29,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.download_service = DownloadService()
-        # NEW: listen for task updates to show detailed errors
         self.download_service.task_updated.connect(self._on_task_updated)
+        # NEW: update status bar when a task is added (captures user-chosen folder)
+        self.download_service.task_added.connect(self._on_task_added)
         self.init_ui()
     
     def init_ui(self):
@@ -78,7 +79,8 @@ class MainWindow(QMainWindow):
         
         # Show download directory once for clarity (removed inner import that caused UnboundLocalError)
         try:
-            self.status_bar.showMessage(f"Ready - Download folder: {Config.DOWNLOADS_DIR}")
+            # replaced fixed path line with helper
+            self._set_download_folder_status(Config.DOWNLOADS_DIR)
         except Exception:
             pass
         
@@ -267,6 +269,11 @@ class MainWindow(QMainWindow):
         # Clear URL input
         self.url_input.clear()
         
+        # After starting, reflect (default) folder (no custom picker here)
+        self._set_download_folder_status(
+            getattr(task, "custom_download_dir", None) or Config.DOWNLOADS_DIR
+        )
+        
         self.status_bar.showMessage(f"Started download: {url}")
     
     def get_current_download_options(self):
@@ -299,3 +306,12 @@ class MainWindow(QMainWindow):
                 "Download Failed",
                 f"Title: {task.title or 'N/A'}\nURL: {task.url}\n\nError:\n{msg}"
             )
+    
+    def _set_download_folder_status(self, path):
+        """Helper to show current download folder."""
+        self.status_bar.showMessage(f"Ready - Download folder: {path}")
+
+    def _on_task_added(self, task):
+        """Update status bar to reflect folder of newly added task."""
+        folder = getattr(task, "custom_download_dir", None) or Config.DOWNLOADS_DIR
+        self._set_download_folder_status(folder)

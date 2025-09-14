@@ -45,14 +45,16 @@ def break_and_pad(text: str, width: int = 20) -> str:
     max_len = max(len(line) for line in lines)
 
     # Step 3: pad each line (left + right)
-    padded_lines = []
-    for line in lines:
-        extra = max_len - len(line)
+    # Pad only the last line
+    max_len = max(len(line) for line in lines)
+    last = lines[-1]
+    extra = max_len - len(last)
+    if extra > 0:
         left = extra // 2
         right = extra - left
-        padded_lines.append(" " * right + line + " " * left)
-
-    return "\n".join(padded_lines)
+        last = "  " * left + last + "  " * right
+    lines[-1] = last
+    return "\n".join(lines)
 
 def _find_font_file() -> Optional[Path]:
     """
@@ -78,8 +80,42 @@ def _find_font_file() -> Optional[Path]:
             return c
     return None
 
+def _x_align_expr(align: str) -> str:
+    """
+    Return an ffmpeg drawtext x-expression for horizontal alignment.
+    center -> centered block
+    left   -> 60px margin
+    right  -> 60px margin from right
+    """
+    a = (align or "center").lower()
+    if a == "left":
+        return "60"
+    if a == "right":
+        return "w-text_w-60"
+    return "(w-text_w)/2"
+
+def _escape_drawtext(text: str) -> str:
+    """
+    Escape a string for safe inclusion in ffmpeg drawtext's text='...'.
+    Rules:
+      - Backslash => \\\\
+      - Single quote => \'
+      - Colon => \:
+      - Percent => %%  (avoid strftime expansion)
+      - Newline chars => \n (literal sequence for multi-line)
+    """
+    if text is None:
+        return ""
+    return (
+        text.replace("\\", "\\\\")
+            .replace("'", r" ")
+            .replace(":", r" ")
+            .replace("%", "%%")
+    )
+
 def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120,
-                         title_prefix="Part", video_title=None, h=1920, w=1080):
+                         title_prefix="Part", video_title=None, h=1920, w=1080,
+                         title_align: str = "center", part_align: str = "center"):
     """Split video into segments and overlay part label (top) and full video title (bottom)."""
     outdir = Path(outfolder)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -88,7 +124,8 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         # Derive from filename if not provided
         stem = input_path.stem
         video_title = stem.rsplit(" - ", 1)[0] if " - " in stem else stem
-    safe_title = break_and_pad(video_title, 30)  # wrap long titles for overlay
+    safe_title_raw = break_and_pad(video_title, 30)
+    safe_title = _escape_drawtext(safe_title_raw)  # wrap long titles for overlay
 
     # Font file integration (prod-aware)
     font_file = _find_font_file()
@@ -110,12 +147,15 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         tasks.append((i, start, out_file, top_text))
 
     def _run_segment(idx, start, out_file, top_text):
+        title_x = _x_align_expr(title_align)
+        part_x = _x_align_expr(part_align)
+        top_text_escaped = _escape_drawtext(top_text)
         vf = (
             f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
             f"drawtext={font_param + ':' if font_param else ''}text='{safe_title}':fontcolor=black:fontsize=36:"
-            f"x=(w-text_w)/2:y=h/4-text_h:box=1:boxcolor=yellow@1:boxborderw=10,"
-            f"drawtext={font_param + ':' if font_param else ''}text='{top_text}':fontcolor=black:fontsize=48:"
-            f"x=(w-text_w)/2:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
+            f"x={title_x}:y=h/4-text_h:box=1:boxcolor=yellow@1:boxborderw=10,"
+            f"drawtext={font_param + ':' if font_param else ''}text='{top_text_escaped}':fontcolor=black:fontsize=48:"
+            f"x={part_x}:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
         )
         cmd = [
             "ffmpeg", "-y",
@@ -213,6 +253,29 @@ def _ffmpeg_available():
     f, p, _ = _locate_ffmpeg()
     return bool(f and p)
 
+def _prepare_download_dir(path_like: str | Path | None) -> Path:
+    """
+    Resolve and ensure a custom download directory.
+    Falls back to Config.DOWNLOADS_DIR if invalid.
+    """
+    if not path_like:
+        return Config.DOWNLOADS_DIR
+    try:
+        p = Path(path_like).expanduser()
+        if not p.is_absolute():
+            p = p.resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        # Basic writable check
+        test_file = p / ".write_test"
+        try:
+            test_file.write_text("ok", encoding="utf-8")
+            test_file.unlink(missing_ok=True)
+        except Exception:
+            return Config.DOWNLOADS_DIR
+        return p
+    except Exception:
+        return Config.DOWNLOADS_DIR
+
 class DownloadWorker(QThread):
     """Worker thread for downloading videos."""
     
@@ -274,7 +337,9 @@ class DownloadWorker(QThread):
             if ffmpeg_dir:
                 os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
 
-            outdir = Config.DOWNLOADS_DIR
+            # Replace original outdir logic with custom directory support
+            custom_dir = getattr(self.task, "custom_download_dir", None)
+            outdir = _prepare_download_dir(custom_dir)
             outdir.mkdir(parents=True, exist_ok=True)
 
             def progress_hook(d):
@@ -434,6 +499,7 @@ class DownloadService(QObject):
     
     task_added = pyqtSignal(DownloadTask)
     task_updated = pyqtSignal(DownloadTask)
+    download_directory_requested = pyqtSignal(str)  # task_id needing a folder
     
     def __init__(self):
         super().__init__()
@@ -473,7 +539,9 @@ class DownloadService(QObject):
                           overlay_title: str | None = None,
                           resolution: int | None = None,
                           resolution_width: int | None = None,
-                          resolution_height: int | None = None) -> DownloadTask:
+                          resolution_height: int | None = None,
+                          download_dir: str | Path | None = None,
+                          ask_directory: bool = False) -> DownloadTask:
         # Capacity advisory (does not block, only warns)
         active_or_queued = sum(
             1 for t in self.tasks.values()
@@ -498,16 +566,42 @@ class DownloadService(QObject):
             resolution_width=resolution_width,
             resolution_height=resolution_height
         )
+        # Custom directory handling
+        if download_dir:
+            setattr(task, "custom_download_dir", str(download_dir))
+        elif ask_directory:
+            # Mark as pending directory selection
+            setattr(task, "custom_download_dir", None)
         self.tasks[task.id] = task
         self.task_added.emit(task)
+        if ask_directory and not download_dir:
+            # Notify GUI to open folder chooser
+            self.download_directory_requested.emit(task.id)
         return task
-    
+
+    def confirm_and_start(self, task_id: str, directory: str | Path):
+        """
+        GUI helper: set directory picked by user and start download.
+        Safe to call multiple times; only first effective if task already started.
+        """
+        task = self.tasks.get(task_id)
+        if not task:
+            return
+        if task.status not in (TaskStatus.PENDING, TaskStatus.QUEUED):
+            return
+        setattr(task, "custom_download_dir", str(directory))
+        self.task_updated.emit(task)
+        self.start_download(task_id)
+
     def start_download(self, task_id: str):
-        """Start downloading a task."""
+        """Start downloading a task (will request directory first if missing)."""
         if task_id not in self.tasks:
             return
-            
         task = self.tasks[task_id]
+        # If directory not chosen yet, trigger request
+        if getattr(task, "custom_download_dir", True) is None:
+            self.download_directory_requested.emit(task.id)
+            return
         # If already active or queued, skip
         if task.status in (TaskStatus.DOWNLOADING, TaskStatus.PROCESSING, TaskStatus.QUEUED):
             return
