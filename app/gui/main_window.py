@@ -5,8 +5,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, 
                             QWidget, QPushButton, QLineEdit, QLabel,
                             QComboBox, QCheckBox, QSplitter, QStatusBar, QTabWidget,
-                            QMessageBox)  # added QMessageBox
-from PyQt6.QtCore import Qt
+                            QMessageBox, QFileDialog)  # + QFileDialog
+from PyQt6.QtCore import Qt, QSettings  # + QSettings
 from app.gui.download_list_widget import DownloadListWidget
 from app.services.download_service import DownloadService
 from app.models.download_task import TaskType, TaskStatus  # ensure TaskStatus imported
@@ -162,13 +162,57 @@ class MainWindow(QMainWindow):
         self.overlay_title_input.setPlaceholderText("Bottom overlay text (leave blank = video title)")
         self.overlay_title_input.setFixedWidth(220)
         split_layout.addWidget(self.overlay_title_input)
-        
+
+        # NEW: Cut head/tail and speed controls
+        split_layout.addWidget(QLabel("Cut head (s):"))
+        self.cut_head_input = QLineEdit()
+        self.cut_head_input.setPlaceholderText("0")
+        self.cut_head_input.setText("0")
+        self.cut_head_input.setFixedWidth(60)
+        split_layout.addWidget(self.cut_head_input)
+
+        split_layout.addWidget(QLabel("Cut tail (s):"))
+        self.cut_tail_input = QLineEdit()
+        self.cut_tail_input.setPlaceholderText("0")
+        self.cut_tail_input.setText("0")
+        self.cut_tail_input.setFixedWidth(60)
+        split_layout.addWidget(self.cut_tail_input)
+
+        split_layout.addWidget(QLabel("Speed (x):"))
+        self.speed_input = QLineEdit()
+        self.speed_input.setPlaceholderText("1.0")
+        self.speed_input.setText("1.0")
+        self.speed_input.setFixedWidth(60)
+        split_layout.addWidget(self.speed_input)
+
         split_layout.addStretch()
         
         # Initially hide split options
         self.split_options_widget.setVisible(True)  # visible because default split enabled
         main_layout.addWidget(self.split_options_widget)
         
+        # NEW: Download folder row
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Download folder:"))
+        self.download_dir_input = QLineEdit()
+        self.download_dir_input.setPlaceholderText("Select folder...")
+        default_folder = QSettings().value("last_download_dir", str(Config.DOWNLOADS_DIR))
+        self.download_dir_input.setText(default_folder)
+        self.download_dir_input.setMinimumWidth(320)
+        browse_btn = QPushButton("Browse...")
+        def _pick_folder():
+            start_dir = self.download_dir_input.text().strip() or str(Path.home())
+            picked = QFileDialog.getExistingDirectory(self, "Select Download Folder", start_dir)
+            if picked:
+                self.download_dir_input.setText(picked)
+                QSettings().setValue("last_download_dir", picked)
+                self._set_download_folder_status(picked)
+        browse_btn.clicked.connect(_pick_folder)
+        folder_row.addWidget(self.download_dir_input)
+        folder_row.addWidget(browse_btn)
+        folder_row.addStretch()
+        main_layout.addLayout(folder_row)
+
         # Convert to horizontal layout for return
         container_widget = QWidget()
         container_widget.setLayout(main_layout)
@@ -233,23 +277,43 @@ class MainWindow(QMainWindow):
         should_split = self.split_checkbox.isChecked()
         
         # Get split options if enabled
-        segment_duration = 120  # default
-        title_prefix = "Part"   # default
+        segment_duration = 120
+        title_prefix = "Part"
         overlay_title = ""
-        
+        cut_head = 0
+        cut_tail = 0
+        speed_factor = 1.0
+
         if should_split:
             try:
                 segment_duration = int(self.duration_input.text() or "120")
             except ValueError:
                 segment_duration = 120
-            
             title_prefix = self.title_prefix_input.text().strip() or "Part"
-            # new: retrieve overlay title
             overlay_title = self.overlay_title_input.text().strip()
+            # NEW: parse cut head/tail and speed
+            try:
+                cut_head = int(self.cut_head_input.text() or "0")
+            except ValueError:
+                cut_head = 0
+            try:
+                cut_tail = int(self.cut_tail_input.text() or "0")
+            except ValueError:
+                cut_tail = 0
+            try:
+                speed_factor = float(self.speed_input.text() or "1.0")
+            except ValueError:
+                speed_factor = 1.0
+            # clamp speed to a safe range (matches dialog behavior)
+            speed_factor = max(0.25, min(4.0, speed_factor))
         
         # Resolution handling
         w, h = self._parse_resolution_spec(self.resolution_input.text())
-        
+
+        # NEW: chosen download folder
+        chosen_dir = self.download_dir_input.text().strip() or str(Config.DOWNLOADS_DIR)
+        QSettings().setValue("last_download_dir", chosen_dir)
+
         # Add download task
         task = self.download_service.add_download_task(
             url=url,
@@ -260,7 +324,13 @@ class MainWindow(QMainWindow):
             title_prefix=title_prefix,
             overlay_title=overlay_title or None,
             resolution_width=w,
-            resolution_height=h
+            resolution_height=h,
+            # trimming and speed (if you already added these earlier)
+            cut_head_seconds=locals().get("cut_head", 0),
+            cut_tail_seconds=locals().get("cut_tail", 0),
+            speed_factor=locals().get("speed_factor", 1.0),
+            # NEW: pass folder
+            download_dir=chosen_dir
         )
         
         # Start download
@@ -269,11 +339,8 @@ class MainWindow(QMainWindow):
         # Clear URL input
         self.url_input.clear()
         
-        # After starting, reflect (default) folder (no custom picker here)
-        self._set_download_folder_status(
-            getattr(task, "custom_download_dir", None) or Config.DOWNLOADS_DIR
-        )
-        
+        # Update status bar with chosen folder
+        self._set_download_folder_status(chosen_dir)
         self.status_bar.showMessage(f"Started download: {url}")
     
     def get_current_download_options(self):
@@ -284,6 +351,20 @@ class MainWindow(QMainWindow):
         except Exception:
             segment_duration = 120
         w, h = self._parse_resolution_spec(self.resolution_input.text())
+        # NEW: provide cut/speed defaults to subscriptions dialog
+        try:
+            cut_head = int(self.cut_head_input.text() or "0")
+        except Exception:
+            cut_head = 0
+        try:
+            cut_tail = int(self.cut_tail_input.text() or "0")
+        except Exception:
+            cut_tail = 0
+        try:
+            speed_factor = float(self.speed_input.text() or "1.0")
+        except Exception:
+            speed_factor = 1.0
+        speed_factor = max(0.25, min(4.0, speed_factor))
         return {
             "output_format": self.format_combo.currentText(),
             "should_split": self.split_checkbox.isChecked(),
@@ -291,7 +372,10 @@ class MainWindow(QMainWindow):
             "title_prefix": (self.title_prefix_input.text().strip() or "Part"),
             "overlay_title": (self.overlay_title_input.text().strip() if self.split_checkbox.isChecked() else ""),
             "resolution_width": w,
-            "resolution_height": h
+            "resolution_height": h,
+            "cut_head_seconds": cut_head,
+            "cut_tail_seconds": cut_tail,
+            "speed_factor": speed_factor
         }
     
     def _on_task_updated(self, task):

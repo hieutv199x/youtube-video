@@ -2,7 +2,8 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
                              QHBoxLayout, QTableWidget, QTableWidgetItem,
                              QSplitter, QAbstractItemView, QHeaderView, QSpinBox,
                              QDialog, QDialogButtonBox, QLineEdit, QCheckBox, QFormLayout,
-                             QSizePolicy, QMessageBox, QFileDialog, QInputDialog)
+                             QSizePolicy, QMessageBox, QFileDialog, QInputDialog,
+                             QDoubleSpinBox)  # + QDoubleSpinBox
 from PyQt6.QtCore import Qt, QSettings
 import os
 from pathlib import Path
@@ -54,6 +55,15 @@ class SplitOptionsDialog(QDialog):
                 self.resolution_edit.setText(str(rh))
         form.addRow("Resolution:", self.resolution_edit)
 
+        # New: Speed factor
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setDecimals(2)
+        self.speed_spin.setRange(0.25, 4.0)
+        self.speed_spin.setSingleStep(0.1)
+        self.speed_spin.setValue(float(defaults.get("speed_factor", 1.0)))
+        self.speed_spin.setToolTip("Playback speed for split parts (video+audio). 1.0 = normal")
+        form.addRow("Speed (x):", self.speed_spin)
+
         # Download folder selector (new)
         folder_layout = QHBoxLayout()
         self.folder_edit = QLineEdit()
@@ -70,6 +80,17 @@ class SplitOptionsDialog(QDialog):
         folder_layout.addWidget(self.folder_edit)
         folder_layout.addWidget(browse_btn)
         form.addRow("Download folder:", folder_layout)
+
+        # Add cut head/tail spinboxes
+        self.cut_head_spin = QSpinBox()
+        self.cut_head_spin.setRange(0, 3600)
+        self.cut_head_spin.setValue(int(defaults.get("cut_head_seconds", 0)))
+        form.addRow("Cut head (s):", self.cut_head_spin)
+
+        self.cut_tail_spin = QSpinBox()
+        self.cut_tail_spin.setRange(0, 3600)
+        self.cut_tail_spin.setValue(int(defaults.get("cut_tail_seconds", 0)))
+        form.addRow("Cut tail (s):", self.cut_tail_spin)
 
         # Enable/disable controls based on split checkbox
         def toggle(enabled):
@@ -107,6 +128,9 @@ class SplitOptionsDialog(QDialog):
         vals["resolution_width"] = rw
         vals["resolution_height"] = rh
         vals["download_dir"] = self.folder_edit.text().strip()
+        vals["cut_head_seconds"] = self.cut_head_spin.value()
+        vals["cut_tail_seconds"] = self.cut_tail_spin.value()
+        vals["speed_factor"] = float(self.speed_spin.value())
         return vals
 
 class SubscriptionsWidget(QWidget):
@@ -446,7 +470,10 @@ class SubscriptionsWidget(QWidget):
             overlay_title=user_opts["overlay_title"] or video.get("title", ""),
             resolution_width=user_opts["resolution_width"] if user_opts["resolution_width"] is not None else base_opts.get("resolution_width"),
             resolution_height=user_opts["resolution_height"] if user_opts["resolution_height"] is not None else base_opts.get("resolution_height"),
-            download_dir=folder
+            download_dir=folder,
+            cut_head_seconds=user_opts.get("cut_head_seconds", 0),
+            cut_tail_seconds=user_opts.get("cut_tail_seconds", 0),
+            speed_factor=user_opts.get("speed_factor", 1.0)
         )
         self.download_service.start_download(task.id)
         btn = self._download_buttons.get(video["url"])

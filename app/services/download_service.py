@@ -115,8 +115,9 @@ def _escape_drawtext(text: str) -> str:
 
 def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120,
                          title_prefix="Part", video_title=None, h=1920, w=1080,
-                         title_align: str = "center", part_align: str = "center"):
-    """Split video into segments and overlay part label (top) and full video title (bottom)."""
+                         title_align: str = "center", part_align: str = "center",
+                         speed_factor: float = 1.0):
+    """Split video into segments and overlay part label and title; optionally adjust playback speed."""
     outdir = Path(outfolder)
     outdir.mkdir(parents=True, exist_ok=True)
     duration = get_video_duration(input_path)
@@ -146,6 +147,25 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         top_text = f"{title_prefix} {i+1}"
         tasks.append((i, start, out_file, top_text))
 
+    def _build_atempo_chain(speed: float) -> list[str]:
+        # Build an atempo chain (each atempo must be between 0.5 and 2.0)
+        if abs(speed - 1.0) < 1e-3:
+            return []
+        chain = []
+        factor = speed
+        # For speed > 2: multiply 2.0 repeatedly
+        while factor > 2.0 + 1e-6:
+            chain.append("atempo=2.0")
+            factor /= 2.0
+        # For speed < 0.5: multiply 0.5 repeatedly
+        while factor < 0.5 - 1e-6:
+            chain.append("atempo=0.5")
+            factor /= 0.5
+        # Remaining factor within [0.5, 2.0]
+        if abs(factor - 1.0) > 1e-3:
+            chain.append(f"atempo={factor:.6f}")
+        return chain
+
     def _run_segment(idx, start, out_file, top_text):
         title_x = _x_align_expr(title_align)
         part_x = _x_align_expr(part_align)
@@ -157,15 +177,28 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
             f"drawtext={font_param + ':' if font_param else ''}text='{top_text_escaped}':fontcolor=black:fontsize=48:"
             f"x={part_x}:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
         )
+        # New: adjust video PTS for speed
+        if abs(speed_factor - 1.0) > 1e-3:
+            vf = f"{vf},setpts=PTS/{speed_factor:.6f}"
+
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
             "-ss", str(start),
             "-t", str(segment_duration),
             "-vf", vf,
-            "-c:a", "copy",
-            str(out_file)
         ]
+
+        # New: audio handling (copy if speed==1, else atempo chain + re-encode)
+        if abs(speed_factor - 1.0) <= 1e-3:
+            cmd += ["-c:a", "copy"]
+        else:
+            atempo_chain = _build_atempo_chain(speed_factor)
+            if atempo_chain:
+                cmd += ["-filter:a", ",".join(atempo_chain)]
+            cmd += ["-c:a", "aac"]
+
+        cmd += [str(out_file)]
         subprocess.run(cmd, check=True)
         return idx, out_file
 
@@ -394,12 +427,32 @@ class DownloadWorker(QThread):
                         raise RuntimeError("Splitting requested but ffmpeg is not available.")
                     self.status_changed.emit(self.task.id, TaskStatus.PROCESSING)
                     try:
+                        # Trim video before splitting if needed
+                        trimmed_file = file_path
+                        head = getattr(self.task, "cut_head_seconds", 0)
+                        tail = getattr(self.task, "cut_tail_seconds", 0)
+                        if head > 0 or tail > 0:
+                            trimmed_file = outdir / f"{file_path.stem}_trimmed{file_path.suffix}"
+                            duration = get_video_duration(file_path)
+                            start = head
+                            end = duration - tail if tail > 0 else duration
+                            trim_duration = max(0, end - start)
+                            trim_cmd = [
+                                "ffmpeg", "-y",
+                                "-i", str(file_path),
+                                "-ss", str(start),
+                                "-t", str(trim_duration),
+                                "-c", "copy",
+                                str(trimmed_file)
+                            ]
+                            subprocess.run(trim_cmd, check=True)
                         segments = split_and_mark_video(
-                            file_path,
+                            trimmed_file,
                             str(outdir),
                             self.task.segment_duration,
                             self.task.title_prefix,
-                            self.task.overlay_title or self.task.title
+                            self.task.overlay_title or self.task.title,
+                            speed_factor=self.task.speed_factor
                         )
                     except Exception as split_error:
                         logger.warning(f"Failed to split video: {split_error}")
@@ -541,7 +594,10 @@ class DownloadService(QObject):
                           resolution_width: int | None = None,
                           resolution_height: int | None = None,
                           download_dir: str | Path | None = None,
-                          ask_directory: bool = False) -> DownloadTask:
+                          ask_directory: bool = False,
+                          cut_head_seconds: int = 0,
+                          cut_tail_seconds: int = 0,
+                          speed_factor: float = 1.0) -> DownloadTask:
         # Capacity advisory (does not block, only warns)
         active_or_queued = sum(
             1 for t in self.tasks.values()
@@ -564,7 +620,10 @@ class DownloadService(QObject):
             title_prefix=title_prefix,
             overlay_title=overlay_title,
             resolution_width=resolution_width,
-            resolution_height=resolution_height
+            resolution_height=resolution_height,
+            cut_head_seconds=cut_head_seconds,
+            cut_tail_seconds=cut_tail_seconds,
+            speed_factor=speed_factor
         )
         # Custom directory handling
         if download_dir:

@@ -45,6 +45,10 @@ class DownloadTask:
     title_prefix: str = "Part"
     segments: List[Path] = field(default_factory=list)
     overlay_title: str | None = None
-    # Single-dimension (legacy) might still be used elsewhere; keep if present
     resolution_width: int | None = None
     resolution_height: int | None = None
+    # New: playback speed for split segments
+    speed_factor: float = 1.0
+    # Add cut head/tail fields
+    cut_head_seconds: int = 0
+    cut_tail_seconds: int = 0
