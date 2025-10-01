@@ -18,6 +18,8 @@ try:
 except Exception:
     psutil = None
 
+from yt_dlp.utils import DownloadError  # NEW
+
 logger = logging.getLogger(__name__)
 
 def get_video_duration(input_path):
@@ -309,6 +311,172 @@ def _prepare_download_dir(path_like: str | Path | None) -> Path:
     except Exception:
         return Config.DOWNLOADS_DIR
 
+# ---------- NEW: yt-dlp fallback helper ----------
+# ---------- NEW: playable format selector helpers ----------
+def _select_muxed_playable_format(info: dict, prefer_mp4: bool = True):
+    """
+    Return a single muxed (audio+video) format dict if available.
+    """
+    fmts = info.get("formats") or []
+    candidates = [
+        f for f in fmts
+        if f.get("vcodec") != "none" and f.get("acodec") != "none" and f.get("url")
+    ]
+    if prefer_mp4:
+        mp4s = [f for f in candidates if (f.get("ext") == "mp4")]
+        if mp4s:
+            # sort by height desc then tbr
+            mp4s.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+            return mp4s[0]
+    if candidates:
+        candidates.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+        return candidates[0]
+    return None
+
+def _select_separate_av_formats(info: dict, prefer_mp4: bool = True):
+    """
+    Return tuple(best_video_format_id, best_audio_format_id) for separate streams if muxed not available.
+    """
+    fmts = info.get("formats") or []
+    videos = [f for f in fmts if f.get("vcodec") != "none" and f.get("acodec") == "none" and f.get("url")]
+    audios = [f for f in fmts if f.get("acodec") != "none" and f.get("vcodec") == "none" and f.get("url")]
+    if prefer_mp4:
+        videos_mp4 = [f for f in videos if f.get("ext") == "mp4"]
+        if videos_mp4:
+            videos = videos_mp4
+    if not videos or not audios:
+        return None, None
+    videos.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
+    audios.sort(key=lambda f: (f.get("tbr") or 0), reverse=True)
+    return videos[0].get("format_id"), audios[0].get("format_id")
+
+def _log_top_formats(info: dict, limit: int = 20):
+    fmts = info.get("formats") or []
+    snippet = []
+    for f in fmts[:limit]:
+        snippet.append(
+            f"{f.get('format_id')}:{f.get('ext')}:{f.get('height')}:{f.get('acodec')}/{f.get('vcodec')}"
+        )
+    logger.info("Available formats (first %d): %s", limit, ", ".join(snippet))
+
+# ---------- UPDATED: yt-dlp fallback helper ----------
+def _download_with_fallback(
+    url: str,
+    base_outtmpl: str,
+    primary_format: str,
+    ffmpeg_dir: str | None,
+    has_ffmpeg: bool,
+    extra_headers: dict | None = None
+):
+    """
+    Attempt download with multiple progressively simpler format selectors.
+    On repeated failure, perform metadata probe and pick first playable format manually.
+    Returns (info_dict, final_format_used)
+    """
+    fallback_formats = [
+        primary_format,
+        "bv*+ba/b",
+        "bestvideo+bestaudio/best",
+        "best[ext=mp4]/best",
+        "best"  # last generic
+    ]
+    extractor_args = {
+        # try multiple client types to mitigate SABR/web-only issues
+        "youtube": {
+            "player_client": ["web", "android", "tv", "ios"]
+        }
+    }
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.youtube.com/"
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    last_err = None
+    for fmt in fallback_formats:
+        opts = {
+            "outtmpl": base_outtmpl,
+            "format": fmt,
+            "ignoreerrors": False,
+            "merge_output_format": "mp4" if has_ffmpeg else None,
+            "retries": 3,
+            "fragment_retries": 3,
+            "extractor_retries": 3,
+            "concurrent_fragment_downloads": 1,
+            "http_headers": headers,
+            "quiet": True,
+            "noprogress": True,
+            "extractor_args": extractor_args
+        }
+        if ffmpeg_dir and has_ffmpeg:
+            opts["ffmpeg_location"] = ffmpeg_dir
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return info, fmt
+        except Exception as e:
+            last_err = e
+            emsg = str(e)
+            if isinstance(e, DownloadError):
+                logger.warning(f"Format selector '{fmt}' failed: {emsg}")
+            else:
+                logger.warning(f"Unexpected failure '{fmt}': {emsg}")
+
+    # Manual probe & selection
+    try:
+        probe_opts = {
+            "quiet": True,
+            "skip_download": True,
+            "extractor_args": extractor_args,
+            "http_headers": headers
+        }
+        if ffmpeg_dir and has_ffmpeg:
+            probe_opts["ffmpeg_location"] = ffmpeg_dir
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        _log_top_formats(info)
+        muxed = _select_muxed_playable_format(info, prefer_mp4=True)
+        if muxed:
+            manual_fmt = muxed.get("format_id")
+            logger.info(f"Manual playable muxed format picked: {manual_fmt}")
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "format": manual_fmt,
+                "outtmpl": base_outtmpl,
+                "ignoreerrors": False,
+                "merge_output_format": "mp4" if has_ffmpeg else None,
+                "http_headers": headers,
+                "extractor_args": extractor_args
+            }) as ydl2:
+                info2 = ydl2.extract_info(url, download=True)
+                return info2, manual_fmt
+        v_id, a_id = _select_separate_av_formats(info, prefer_mp4=True)
+        if v_id and a_id:
+            combo = f"{v_id}+{a_id}"
+            logger.info(f"Manual separate A/V format picked: {combo}")
+            with yt_dlp.YoutubeDL({
+                "quiet": True,
+                "format": combo,
+                "outtmpl": base_outtmpl,
+                "ignoreerrors": False,
+                "merge_output_format": "mp4" if has_ffmpeg else None,
+                "http_headers": headers,
+                "extractor_args": extractor_args
+            }) as ydl3:
+                info3 = ydl3.extract_info(url, download=True)
+                return info3, combo
+        logger.error("Probe succeeded but no playable formats with direct URLs were found.")
+        if last_err:
+            raise last_err
+        raise DownloadError("No playable formats located after probe.")
+    except Exception as probe_err:
+        if last_err:
+            raise last_err
+        raise probe_err
+
 class DownloadWorker(QThread):
     """Worker thread for downloading videos."""
     
@@ -391,74 +559,71 @@ class DownloadWorker(QThread):
 
             # Determine format selector (may override for fallback)
             if fallback_no_ffmpeg:
-                # Use a single progressive format (no separate A/V -> no merge)
                 format_selector = "best[ext=mp4]/best"
             else:
                 format_selector = self._get_format_selector()
 
-            ydl_opts = {
-                'outtmpl': str(outdir / '%(title)s - %(id)s.%(ext)s'),
-                'format': format_selector,
-                'merge_output_format': None if fallback_no_ffmpeg else self.task.output_format,
-                'progress_hooks': [progress_hook],
-                'ignoreerrors': False,
-            }
-            if ffmpeg_dir and has_ffmpeg:
-                ydl_opts['ffmpeg_location'] = ffmpeg_dir
+            base_outtmpl = str(outdir / '%(title)s - %(id)s.%(ext)s')
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.task.url, download=True)
-                if info and not self.task.title:
-                    self.task.title = info.get('title') or self.task.title
+            # UPDATED: robust download with detailed fallback
+            info, used_fmt = _download_with_fallback(
+                self.task.url,
+                base_outtmpl=base_outtmpl,
+                primary_format=format_selector,
+                ffmpeg_dir=ffmpeg_dir if has_ffmpeg else None,
+                has_ffmpeg=has_ffmpeg
+            )
+            if info and not self.task.title:
+                self.task.title = info.get('title') or self.task.title
+            logger.debug(f"Final format used: {used_fmt}")
 
-                # Try both output_format and mp4 when fallback used
-                search_ext = self.task.output_format if not fallback_no_ffmpeg else "mp4"
-                downloaded_files = list(outdir.glob(f"*{info['id']}*.{search_ext}")) if info else []
-                if not downloaded_files:
-                    # Last resort: any file with the id
-                    downloaded_files = list(outdir.glob(f"*{info['id']}*"))
-                if not downloaded_files:
-                    raise Exception("Downloaded file not found after yt-dlp run.")
-                file_path = downloaded_files[0]
-                segments = []
+            # Resolve downloaded file (re-using previous logic)
+            search_ext = self.task.output_format if (has_ffmpeg and not fallback_no_ffmpeg) else "mp4"
+            downloaded_files = list(outdir.glob(f"*{info['id']}*.{search_ext}")) if info else []
+            if not downloaded_files:
+                downloaded_files = list(outdir.glob(f"*{info['id']}*"))
+            if not downloaded_files:
+                raise Exception("Downloaded file not found after yt-dlp run.")
+            file_path = downloaded_files[0]
+            segments = []
 
-                if self.task.should_split:
-                    if not has_ffmpeg:
-                        raise RuntimeError("Splitting requested but ffmpeg is not available.")
-                    self.status_changed.emit(self.task.id, TaskStatus.PROCESSING)
-                    try:
-                        # Trim video before splitting if needed
-                        trimmed_file = file_path
-                        head = getattr(self.task, "cut_head_seconds", 0)
-                        tail = getattr(self.task, "cut_tail_seconds", 0)
-                        if head > 0 or tail > 0:
-                            trimmed_file = outdir / f"{file_path.stem}_trimmed{file_path.suffix}"
-                            duration = get_video_duration(file_path)
-                            start = head
-                            end = duration - tail if tail > 0 else duration
-                            trim_duration = max(0, end - start)
-                            trim_cmd = [
-                                "ffmpeg", "-y",
-                                "-i", str(file_path),
-                                "-ss", str(start),
-                                "-t", str(trim_duration),
-                                "-c", "copy",
-                                str(trimmed_file)
-                            ]
-                            subprocess.run(trim_cmd, check=True)
-                        segments = split_and_mark_video(
-                            trimmed_file,
-                            str(outdir),
-                            self.task.segment_duration,
-                            self.task.title_prefix,
-                            self.task.overlay_title or self.task.title,
-                            speed_factor=self.task.speed_factor
-                        )
-                    except Exception as split_error:
-                        logger.warning(f"Failed to split video: {split_error}")
+            if self.task.should_split:
+                if not has_ffmpeg:
+                    raise RuntimeError("Splitting requested but ffmpeg is not available.")
+                self.status_changed.emit(self.task.id, TaskStatus.PROCESSING)
+                try:
+                    # Trim video before splitting if needed
+                    trimmed_file = file_path
+                    head = getattr(self.task, "cut_head_seconds", 0)
+                    tail = getattr(self.task, "cut_tail_seconds", 0)
+                    if head > 0 or tail > 0:
+                        trimmed_file = outdir / f"{file_path.stem}_trimmed{file_path.suffix}"
+                        duration = get_video_duration(file_path)
+                        start = head
+                        end = duration - tail if tail > 0 else duration
+                        trim_duration = max(0, end - start)
+                        trim_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", str(file_path),
+                            "-ss", str(start),
+                            "-t", str(trim_duration),
+                            "-c", "copy",
+                            str(trimmed_file)
+                        ]
+                        subprocess.run(trim_cmd, check=True)
+                    segments = split_and_mark_video(
+                        trimmed_file,
+                        str(outdir),
+                        self.task.segment_duration,
+                        self.task.title_prefix,
+                        self.task.overlay_title or self.task.title,
+                        speed_factor=self.task.speed_factor
+                    )
+                except Exception as split_error:
+                    logger.warning(f"Failed to split video: {split_error}")
 
-                self.download_completed.emit(self.task.id, str(file_path), segments)
-                self.status_changed.emit(self.task.id, TaskStatus.COMPLETED)
+            self.download_completed.emit(self.task.id, str(file_path), segments)
+            self.status_changed.emit(self.task.id, TaskStatus.COMPLETED)
 
         except Exception as e:
             msg = str(e)
