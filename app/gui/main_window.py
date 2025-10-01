@@ -5,8 +5,8 @@ from pathlib import Path
 from PyQt6.QtWidgets import (QMainWindow, QVBoxLayout, QHBoxLayout, 
                             QWidget, QPushButton, QLineEdit, QLabel,
                             QComboBox, QCheckBox, QSplitter, QStatusBar, QTabWidget,
-                            QMessageBox, QFileDialog)  # + QFileDialog
-from PyQt6.QtCore import Qt, QSettings  # + QSettings
+                            QMessageBox, QFileDialog)
+from PyQt6.QtCore import Qt, QSettings
 from app.gui.download_list_widget import DownloadListWidget
 from app.services.download_service import DownloadService
 from app.models.download_task import TaskType, TaskStatus  # ensure TaskStatus imported
@@ -185,6 +185,30 @@ class MainWindow(QMainWindow):
         self.speed_input.setFixedWidth(60)
         split_layout.addWidget(self.speed_input)
 
+        # NEW: subtitles controls
+        split_layout.addWidget(QLabel("Burn subs:"))
+        self.burn_subs_checkbox = QCheckBox()
+        self.burn_subs_checkbox.setChecked(True)
+        split_layout.addWidget(self.burn_subs_checkbox)
+
+        split_layout.addWidget(QLabel("Langs:"))
+        self.subtitle_langs_input = QLineEdit()
+        self.subtitle_langs_input.setPlaceholderText("en")
+        self.subtitle_langs_input.setText("en")
+        self.subtitle_langs_input.setFixedWidth(100)
+        split_layout.addWidget(self.subtitle_langs_input)
+
+        # New: overlay toggles
+        split_layout.addWidget(QLabel("Show title:"))
+        self.show_title_checkbox = QCheckBox()
+        self.show_title_checkbox.setChecked(True)
+        split_layout.addWidget(self.show_title_checkbox)
+
+        split_layout.addWidget(QLabel("Show part:"))
+        self.show_part_checkbox = QCheckBox()
+        self.show_part_checkbox.setChecked(True)
+        split_layout.addWidget(self.show_part_checkbox)
+
         split_layout.addStretch()
         
         # Initially hide split options
@@ -283,6 +307,10 @@ class MainWindow(QMainWindow):
         cut_head = 0
         cut_tail = 0
         speed_factor = 1.0
+        burn_subtitles = True
+        subtitle_langs = ["en", "vi"]
+        show_title = True
+        show_part = True
 
         if should_split:
             try:
@@ -307,6 +335,15 @@ class MainWindow(QMainWindow):
             # clamp speed to a safe range (matches dialog behavior)
             speed_factor = max(0.25, min(4.0, speed_factor))
         
+        # NEW: parse subtitle opts
+        burn_subtitles = self.burn_subs_checkbox.isChecked()
+        langs_spec = self.subtitle_langs_input.text().strip() or "en"
+        subtitle_langs = [p.strip() for p in langs_spec.split(",") if p.strip()]
+
+        # NEW: parse overlay visibility
+        show_title = self.show_title_checkbox.isChecked()
+        show_part = self.show_part_checkbox.isChecked()
+
         # Resolution handling
         w, h = self._parse_resolution_spec(self.resolution_input.text())
 
@@ -330,7 +367,13 @@ class MainWindow(QMainWindow):
             cut_tail_seconds=locals().get("cut_tail", 0),
             speed_factor=locals().get("speed_factor", 1.0),
             # NEW: pass folder
-            download_dir=chosen_dir
+            download_dir=chosen_dir,
+            # NEW: pass subtitle options
+            burn_subtitles=burn_subtitles,
+            subtitle_langs=subtitle_langs,
+            # new overlays
+            show_title_overlay=show_title,
+            show_part_overlay=show_part
         )
         
         # Start download
@@ -365,6 +408,9 @@ class MainWindow(QMainWindow):
         except Exception:
             speed_factor = 1.0
         speed_factor = max(0.25, min(4.0, speed_factor))
+        # NEW: pass subs defaults
+        langs_spec = self.subtitle_langs_input.text().strip() if hasattr(self, "subtitle_langs_input") else "en"
+        subtitle_langs = [p.strip() for p in (langs_spec or "en").split(",") if p.strip()]
         return {
             "output_format": self.format_combo.currentText(),
             "should_split": self.split_checkbox.isChecked(),
@@ -375,7 +421,11 @@ class MainWindow(QMainWindow):
             "resolution_height": h,
             "cut_head_seconds": cut_head,
             "cut_tail_seconds": cut_tail,
-            "speed_factor": speed_factor
+            "speed_factor": speed_factor,
+            "burn_subtitles": self.burn_subs_checkbox.isChecked() if hasattr(self, "burn_subs_checkbox") else True,
+            "subtitle_langs": subtitle_langs,
+            "show_title_overlay": self.show_title_checkbox.isChecked() if hasattr(self, "show_title_checkbox") else True,
+            "show_part_overlay": self.show_part_checkbox.isChecked() if hasattr(self, "show_part_checkbox") else True,
         }
     
     def _on_task_updated(self, task):

@@ -52,3 +52,9 @@ class DownloadTask:
     # Add cut head/tail fields
     cut_head_seconds: int = 0
     cut_tail_seconds: int = 0
+    # New: burn subtitles into output (dual-language supported)
+    burn_subtitles: bool = False
+    subtitle_langs: List[str] = field(default_factory=lambda: ["en", "vi"])
+    # New: control drawtext overlays
+    show_title_overlay: bool = True
+    show_part_overlay: bool = True

@@ -13,6 +13,9 @@ import platform
 import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
+import time  # added: used in subtitle retry backoff
+from PyQt6.QtCore import QEventLoop, pyqtSlot  # added: sync dialog wait and slot
+from PyQt6.QtWidgets import QDialog, QPlainTextEdit, QVBoxLayout, QDialogButtonBox, QTabWidget, QWidget, QLabel  # added: review dialog UI
 try:
     import psutil  # optional
 except Exception:
@@ -95,14 +98,14 @@ def _x_align_expr(align: str) -> str:
     return "(w-text_w)/2"
 
 def _escape_drawtext(text: str) -> str:
-    """
+    r"""
     Escape a string for safe inclusion in ffmpeg drawtext's text='...'.
     Rules:
       - Backslash => \\\\
       - Single quote => \'
-      - Colon => \:
+      - Colon => \\:
       - Percent => %%  (avoid strftime expansion)
-      - Newline chars => \n (literal sequence for multi-line)
+      - Newline chars => \\n (literal sequence for multi-line)
     """
     if text is None:
         return ""
@@ -113,11 +116,71 @@ def _escape_drawtext(text: str) -> str:
             .replace("%", "%%")
     )
 
+def _escape_path_for_ff(path: Path | str) -> str:
+    """Escape a filesystem path for ffmpeg filter args."""
+    return str(path).replace("\\", "\\\\").replace(":", "\\:")
+
+def _convert_vtt_to_srt(src: Path, dst: Path) -> bool:
+    """Convert .vtt to .srt using ffmpeg."""
+    try:
+        subprocess.run(["ffmpeg", "-y", "-i", str(src), str(dst)], check=True)
+        return dst.exists()
+    except Exception:
+        return False
+
+def _safe_read_text(p: Path) -> str:
+    """Read text with reasonable fallbacks."""
+    for enc in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
+        try:
+            return p.read_text(encoding=enc, errors="strict")
+        except Exception:
+            continue
+    try:
+        return p.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+class SubtitleReviewDialog(QDialog):
+    """Simple dialog to review and edit up to two subtitle files."""
+    def __init__(self, parent=None, items: list[dict] | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Review Subtitles")
+        self.resize(800, 600)
+        self._items = items or []
+        self._editors = []
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget(self)
+        for it in self._items:
+            lang = (it.get("lang") or "sub").upper()
+            path: Path = it.get("path")
+            page = QWidget()
+            v = QVBoxLayout(page)
+            v.addWidget(QLabel(f"{lang} - {path.name if path else ''}"))
+            ed = QPlainTextEdit()
+            ed.setPlainText(it.get("text") or "")
+            v.addWidget(ed)
+            tabs.addTab(page, lang)
+            self._editors.append(ed)
+        layout.addWidget(tabs)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def get_results(self) -> list[dict]:
+        return [
+            {"lang": it.get("lang"), "path": it.get("path"), "text": self._editors[i].toPlainText()}
+            for i, it in enumerate(self._items)
+        ]
+
 def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120,
                          title_prefix="Part", video_title=None, h=1920, w=1080,
                          title_align: str = "center", part_align: str = "center",
-                         speed_factor: float = 1.0):
-    """Split video into segments and overlay part label and title; optionally adjust playback speed."""
+                         speed_factor: float = 1.0,
+                         subtitle_files: Optional[list[Path]] = None,
+                         show_title_overlay: bool = True,
+                         show_part_overlay: bool = True):
+    """Split video into segments; overlay labels; optionally burn up to two subtitle files."""
     outdir = Path(outfolder)
     outdir.mkdir(parents=True, exist_ok=True)
     duration = get_video_duration(input_path)
@@ -126,15 +189,27 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         stem = input_path.stem
         video_title = stem.rsplit(" - ", 1)[0] if " - " in stem else stem
     safe_title_raw = break_and_pad(video_title, 30)
-    safe_title = _escape_drawtext(safe_title_raw)  # wrap long titles for overlay
+    safe_title = _escape_drawtext(safe_title_raw)
 
-    # Font file integration (prod-aware)
     font_file = _find_font_file()
     font_param = ""
     if font_file:
-        # Escape backslashes and colons for ffmpeg drawtext parser
-        escaped_font_path = str(font_file).replace("\\", "\\\\").replace(":", "\\:")
-        font_param = f"fontfile='{escaped_font_path}'"
+        font_param = f"fontfile='{_escape_path_for_ff(font_file)}'"
+
+    # Prepare a single subtitle filter (first available), scaled by output height
+    sub_filters = ""
+    if subtitle_files:
+        selected = subtitle_files[0]  # only one subtitle shown
+        # Scale font and margin relative to output height (smaller base to avoid oversized text on tall videos)
+        base_font_1080 = 20
+        base_margin_1080 = 40
+        margin_v = max(20, int(round((h / 1080.0) * base_margin_1080)))
+        # Transparent background (BorderStyle=1), white text, black outline, bottom-center (Alignment=2)
+        base_style = (
+            f"FontSize=8,BorderStyle=1,Outline=2,Shadow=0,"
+            f"PrimaryColour=&H00FFFFFF&,OutlineColour=&H00000000,Alignment=2,MarginV={margin_v}"
+        )
+        sub_filters = f",subtitles='{_escape_path_for_ff(selected)}':force_style='{base_style}'"
 
     num_parts = int(duration // segment_duration) + (1 if duration % segment_duration > 0 else 0)
     segments = []
@@ -170,17 +245,22 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
         title_x = _x_align_expr(title_align)
         part_x = _x_align_expr(part_align)
         top_text_escaped = _escape_drawtext(top_text)
-        vf = (
-            f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,"
-            f"drawtext={font_param + ':' if font_param else ''}text='{safe_title}':fontcolor=black:fontsize=36:"
-            f"x={title_x}:y=h/4-text_h:box=1:boxcolor=yellow@1:boxborderw=10,"
-            f"drawtext={font_param + ':' if font_param else ''}text='{top_text_escaped}':fontcolor=black:fontsize=48:"
-            f"x={part_x}:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
-        )
-        # New: adjust video PTS for speed
+        # Build base vf
+        vf = f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2"
+        if show_title_overlay:
+            vf += (
+                f",drawtext={font_param + ':' if font_param else ''}text='{safe_title}':fontcolor=black:fontsize=36:"
+                f"x={title_x}:y=h/4-text_h:box=1:boxcolor=yellow@1:boxborderw=10"
+            )
+        if show_part_overlay:
+            vf += (
+                f",drawtext={font_param + ':' if font_param else ''}text='{top_text_escaped}':fontcolor=black:fontsize=48:"
+                f"x={part_x}:y=h-text_h-h/4:box=1:boxcolor=yellow@1:boxborderw=10"
+            )
+        if sub_filters:
+            vf = f"{vf}{sub_filters}"
         if abs(speed_factor - 1.0) > 1e-3:
             vf = f"{vf},setpts=PTS/{speed_factor:.6f}"
-
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_path),
@@ -188,7 +268,6 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
             "-t", str(segment_duration),
             "-vf", vf,
         ]
-
         # New: audio handling (copy if speed==1, else atempo chain + re-encode)
         if abs(speed_factor - 1.0) <= 1e-3:
             cmd += ["-c:a", "copy"]
@@ -197,7 +276,6 @@ def split_and_mark_video(input_path, outfolder="downloads", segment_duration=120
             if atempo_chain:
                 cmd += ["-filter:a", ",".join(atempo_chain)]
             cmd += ["-c:a", "aac"]
-
         cmd += [str(out_file)]
         subprocess.run(cmd, check=True)
         return idx, out_file
@@ -321,11 +399,26 @@ class DownloadWorker(QThread):
         super().__init__()
         self.task = task
         self._cancelled = False
-    
+        self._service = None        # set by DownloadService
+        self._loop: QEventLoop | None = None
+        self._subtitle_paths_response: list[Path] | None = None
+
     def cancel(self):
         """Cancel the download."""
         self._cancelled = True
     
+    @pyqtSlot(str, object)
+    def _on_subtitle_review_response(self, task_id: str, updated):
+        """Receive edited subtitle paths from main thread and unblock."""
+        if task_id != self.task.id:
+            return
+        try:
+            self._subtitle_paths_response = [Path(u) for u in (updated or [])]
+        except Exception:
+            self._subtitle_paths_response = None
+        if self._loop and self._loop.isRunning():
+            self._loop.quit()
+
     def run(self):
         """Execute the download task."""
         try:
@@ -336,43 +429,30 @@ class DownloadWorker(QThread):
             ffmpeg_path, ffprobe_path, ffmpeg_dir = _locate_ffmpeg()
             has_ffmpeg = bool(ffmpeg_path and ffprobe_path)
 
-            # Pre-fetch metadata for title (safe even without ffmpeg)
-            preliminary_opts = {
-                'quiet': True,
-                'skip_download': True,
-                'ignoreerrors': False,
-            }
+            # Pre-fetch metadata for title
+            preliminary_opts = {'quiet': True, 'skip_download': True, 'ignoreerrors': False}
             try:
                 with yt_dlp.YoutubeDL(preliminary_opts) as meta_ydl:
                     info = meta_ydl.extract_info(self.task.url, download=False)
                     if info:
                         self.task.title = info.get('title') or self.task.title
             except Exception:
-                pass  # keep going
+                pass
 
             splitting_required = self.task.should_split
             video_processing_required = (self.task.task_type != TaskType.AUDIO_ONLY)
-
-            # Fallback mode: allow simple progressive download if only merge was needed
             fallback_no_ffmpeg = (
-                not has_ffmpeg
-                and video_processing_required
-                and not splitting_required
+                not has_ffmpeg and video_processing_required and not splitting_required
                 and self.task.task_type == TaskType.VIDEO_AUDIO
             )
-
             if not has_ffmpeg and not fallback_no_ffmpeg:
                 if video_processing_required or splitting_required:
-                    raise RuntimeError(
-                        "FFmpeg not found. Required for this operation (video muxing / splitting)."
-                    )
+                    raise RuntimeError("FFmpeg not found. Required for this operation (video muxing / splitting).")
 
             if ffmpeg_dir:
                 os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
 
-            # Replace original outdir logic with custom directory support
-            custom_dir = getattr(self.task, "custom_download_dir", None)
-            outdir = _prepare_download_dir(custom_dir)
+            outdir = _prepare_download_dir(getattr(self.task, "custom_download_dir", None))
             outdir.mkdir(parents=True, exist_ok=True)
 
             def progress_hook(d):
@@ -389,76 +469,141 @@ class DownloadWorker(QThread):
                     eta_str = f"{eta}s" if eta else "Unknown"
                     self.progress_updated.emit(self.task.id, progress, speed_str, eta_str)
 
-            # Determine format selector (may override for fallback)
-            if fallback_no_ffmpeg:
-                # Use a single progressive format (no separate A/V -> no merge)
-                format_selector = "best[ext=mp4]/best"
-            else:
-                format_selector = self._get_format_selector()
-
-            ydl_opts = {
+            # 1) Download media ONLY (do not bundle subtitle download with this step)
+            format_selector = "best[ext=mp4]/best" if fallback_no_ffmpeg else self._get_format_selector()
+            ydl_media_opts = {
                 'outtmpl': str(outdir / '%(title)s - %(id)s.%(ext)s'),
                 'format': format_selector,
                 'merge_output_format': None if fallback_no_ffmpeg else self.task.output_format,
                 'progress_hooks': [progress_hook],
                 'ignoreerrors': False,
+                'overwrites': True,
             }
             if ffmpeg_dir and has_ffmpeg:
-                ydl_opts['ffmpeg_location'] = ffmpeg_dir
+                ydl_media_opts['ffmpeg_location'] = ffmpeg_dir
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(ydl_media_opts) as ydl:
                 info = ydl.extract_info(self.task.url, download=True)
                 if info and not self.task.title:
                     self.task.title = info.get('title') or self.task.title
 
-                # Try both output_format and mp4 when fallback used
-                search_ext = self.task.output_format if not fallback_no_ffmpeg else "mp4"
-                downloaded_files = list(outdir.glob(f"*{info['id']}*.{search_ext}")) if info else []
-                if not downloaded_files:
-                    # Last resort: any file with the id
-                    downloaded_files = list(outdir.glob(f"*{info['id']}*"))
-                if not downloaded_files:
-                    raise Exception("Downloaded file not found after yt-dlp run.")
-                file_path = downloaded_files[0]
-                segments = []
+            # Resolve downloaded file
+            search_ext = self.task.output_format if not fallback_no_ffmpeg else "mp4"
+            downloaded_files = list(outdir.glob(f"*{info['id']}*.{search_ext}")) if info else []
+            if not downloaded_files:
+                downloaded_files = list(outdir.glob(f"*{info['id']}*"))
+            if not downloaded_files:
+                raise Exception("Downloaded file not found after yt-dlp run.")
+            file_path = downloaded_files[0]
 
-                if self.task.should_split:
-                    if not has_ffmpeg:
-                        raise RuntimeError("Splitting requested but ffmpeg is not available.")
-                    self.status_changed.emit(self.task.id, TaskStatus.PROCESSING)
-                    try:
-                        # Trim video before splitting if needed
-                        trimmed_file = file_path
-                        head = getattr(self.task, "cut_head_seconds", 0)
-                        tail = getattr(self.task, "cut_tail_seconds", 0)
-                        if head > 0 or tail > 0:
-                            trimmed_file = outdir / f"{file_path.stem}_trimmed{file_path.suffix}"
-                            duration = get_video_duration(file_path)
-                            start = head
-                            end = duration - tail if tail > 0 else duration
-                            trim_duration = max(0, end - start)
-                            trim_cmd = [
-                                "ffmpeg", "-y",
-                                "-i", str(file_path),
-                                "-ss", str(start),
-                                "-t", str(trim_duration),
-                                "-c", "copy",
-                                str(trimmed_file)
-                            ]
-                            subprocess.run(trim_cmd, check=True)
-                        segments = split_and_mark_video(
-                            trimmed_file,
-                            str(outdir),
-                            self.task.segment_duration,
-                            self.task.title_prefix,
-                            self.task.overlay_title or self.task.title,
-                            speed_factor=self.task.speed_factor
-                        )
-                    except Exception as split_error:
-                        logger.warning(f"Failed to split video: {split_error}")
+            # 2) Try subtitle download PER LANGUAGE (non-fatal, retried)
+            subtitle_paths: list[Path] = []
+            if getattr(self.task, "burn_subtitles", False):
+                langs = [l for l in (self.task.subtitle_langs or []) if isinstance(l, str) and l.strip()]
+                if not langs:
+                    langs = ["en", "vi"]
 
-                self.download_completed.emit(self.task.id, str(file_path), segments)
-                self.status_changed.emit(self.task.id, TaskStatus.COMPLETED)
+                def _fetch_lang(lang: str):
+                    # Retry small number of times (e.g., to mitigate 429 a bit)
+                    attempts = 2
+                    for k in range(attempts):
+                        try:
+                            sub_opts = {
+                                'skip_download': True,
+                                'writesubtitles': True,
+                                'writeautomaticsub': True,
+                                'subtitleslangs': [lang],
+                                'subtitlesformat': 'srt/best',
+                                'ignoreerrors': True,
+                                'quiet': True,
+                                'outtmpl': str(outdir / '%(title)s - %(id)s.%(ext)s'),
+                            }
+                            with yt_dlp.YoutubeDL(sub_opts) as sdl:
+                                sdl.download([self.task.url])
+                            break
+                        except Exception as se:
+                            logger.warning(f"Subtitle download failed for '{lang}' (attempt {k+1}): {se}")
+                            time.sleep(1.0 if k == 0 else 2.0)
+
+                for lang in langs:
+                    _fetch_lang(lang)
+
+                # Gather srt or convert vtt -> srt
+                for lang in langs:
+                    srt = list(outdir.glob(f"*{info['id']}*{lang}*.srt"))
+                    if not srt:
+                        vtt = list(outdir.glob(f"*{info['id']}*{lang}*.vtt"))
+                        if vtt:
+                            cand = vtt[0].with_suffix(".srt")
+                            if _convert_vtt_to_srt(vtt[0], cand):
+                                srt = [cand]
+                    if srt:
+                        subtitle_paths.append(srt[0])
+
+            # Ask user to review/edit subtitles before splitting (blocking until response)
+            if subtitle_paths and self.task.should_split and getattr(self.task, "burn_subtitles", False) and self._service:
+                def _guess_lang(p: Path) -> str:
+                    name = p.name.lower()
+                    for lc in (self.task.subtitle_langs or []):
+                        if f".{lc.lower()}." in name or f"-{lc.lower()}." in name or name.endswith(f"{lc.lower()}.srt"):
+                            return lc
+                    return "sub"
+                items = [{"lang": _guess_lang(p), "path": p, "text": _safe_read_text(p)} for p in subtitle_paths[:2]]
+                self._loop = QEventLoop()
+                self._service.subtitle_review_response.connect(self._on_subtitle_review_response)
+                self._service.subtitle_review_requested.emit(self.task.id, items)
+                self._loop.exec()
+                try:
+                    self._service.subtitle_review_response.disconnect(self._on_subtitle_review_response)
+                except Exception:
+                    pass
+                if self._subtitle_paths_response:
+                    subtitle_paths = self._subtitle_paths_response
+
+            segments = []
+            if self.task.should_split:
+                if not has_ffmpeg:
+                    raise RuntimeError("Splitting requested but ffmpeg is not available.")
+                self.status_changed.emit(self.task.id, TaskStatus.PROCESSING)
+                try:
+                    # Optional trimming
+                    trimmed_file = file_path
+                    head = getattr(self.task, "cut_head_seconds", 0)
+                    tail = getattr(self.task, "cut_tail_seconds", 0)
+                    if head > 0 or tail > 0:
+                        trimmed_file = outdir / f"{file_path.stem}_trimmed{file_path.suffix}"
+                        duration = get_video_duration(file_path)
+                        start = head
+                        end = duration - tail if tail > 0 else duration
+                        trim_duration = max(0, end - start)
+                        trim_cmd = [
+                            "ffmpeg", "-y",
+                            "-i", str(file_path),
+                            "-ss", str(start),
+                            "-t", str(trim_duration),
+                            "-c", "copy",
+                            str(trimmed_file)
+                        ]
+                        subprocess.run(trim_cmd, check=True)
+
+                    # Use only the first subtitle file (if any)
+                    selected_subs = [subtitle_paths[0]] if subtitle_paths else None
+                    segments = split_and_mark_video(
+                        trimmed_file,
+                        str(outdir),
+                        self.task.segment_duration,
+                        self.task.title_prefix,
+                        self.task.overlay_title or self.task.title,
+                        speed_factor=self.task.speed_factor,
+                        subtitle_files=selected_subs,
+                        show_title_overlay=getattr(self.task, "show_title_overlay", True),
+                        show_part_overlay=getattr(self.task, "show_part_overlay", True)
+                    )
+                except Exception as split_error:
+                    logger.warning(f"Failed to split/burn subtitles: {split_error}")
+
+            self.download_completed.emit(self.task.id, str(file_path), segments)
+            self.status_changed.emit(self.task.id, TaskStatus.COMPLETED)
 
         except Exception as e:
             msg = str(e)
@@ -470,7 +615,7 @@ class DownloadWorker(QThread):
             logger.error(f"Download failed for task {self.task.id}: {msg}")
             self.error_occurred.emit(self.task.id, msg)
             self.status_changed.emit(self.task.id, TaskStatus.FAILED)
-    
+
     def _get_format_selector(self) -> str:
         """Select format with optional width/height constraints."""
         w = getattr(self.task, "resolution_width", None)
@@ -553,7 +698,10 @@ class DownloadService(QObject):
     task_added = pyqtSignal(DownloadTask)
     task_updated = pyqtSignal(DownloadTask)
     download_directory_requested = pyqtSignal(str)  # task_id needing a folder
-    
+    # NEW: subtitle review bridge signals
+    subtitle_review_requested = pyqtSignal(str, object)  # task_id, items[{lang,path,text}]
+    subtitle_review_response = pyqtSignal(str, object)   # task_id, updated_paths[list[Path]]
+
     def __init__(self):
         super().__init__()
         # Override Config.DOWNLOADS_DIR once with a stable absolute path
@@ -567,6 +715,8 @@ class DownloadService(QObject):
         self.queue = []  # task ids waiting
         self.max_concurrent = Config.MAX_CONCURRENT_DOWNLOADS
         self._apply_resource_tuning()
+        # Connect review handler (runs in GUI thread)
+        self.subtitle_review_requested.connect(self._on_subtitle_review_requested)
 
     def _apply_resource_tuning(self):
         limits = _compute_resource_limits()
@@ -597,7 +747,11 @@ class DownloadService(QObject):
                           ask_directory: bool = False,
                           cut_head_seconds: int = 0,
                           cut_tail_seconds: int = 0,
-                          speed_factor: float = 1.0) -> DownloadTask:
+                          speed_factor: float = 1.0,
+                          burn_subtitles: bool = False,
+                          subtitle_langs: Optional[list[str]] = None,
+                          show_title_overlay: bool = True,
+                          show_part_overlay: bool = True) -> DownloadTask:
         # Capacity advisory (does not block, only warns)
         active_or_queued = sum(
             1 for t in self.tasks.values()
@@ -623,7 +777,11 @@ class DownloadService(QObject):
             resolution_height=resolution_height,
             cut_head_seconds=cut_head_seconds,
             cut_tail_seconds=cut_tail_seconds,
-            speed_factor=speed_factor
+            speed_factor=speed_factor,
+            burn_subtitles=burn_subtitles,
+            subtitle_langs=subtitle_langs or ["en", "vi"],
+            show_title_overlay=show_title_overlay,
+            show_part_overlay=show_part_overlay
         )
         # Custom directory handling
         if download_dir:
@@ -680,6 +838,7 @@ class DownloadService(QObject):
         worker.error_occurred.connect(self._on_error_occurred)
         worker.download_completed.connect(self._on_download_completed)
         worker.finished.connect(lambda: self._on_worker_finished(task.id))
+        worker._service = self  # provide back-reference for dialogs
         self.active_workers[task.id] = worker
         worker.start()
 
@@ -741,6 +900,44 @@ class DownloadService(QObject):
             if segments:
                 task.segments = [Path(seg) for seg in segments]
             self.task_updated.emit(task)
+        if task_id in self.tasks:
+            task = self.tasks[task_id]
+            task.output_path = Path(file_path)
             if segments:
                 task.segments = [Path(seg) for seg in segments]
             self.task_updated.emit(task)
+        if task_id in self.tasks:
+            task = self.tasks[task_id]
+            task.output_path = Path(file_path)
+            if segments:
+                task.segments = [Path(seg) for seg in segments]
+            self.task_updated.emit(task)
+            if segments:
+                task.segments = [Path(seg) for seg in segments]
+            self.task_updated.emit(task)
+
+    def _on_subtitle_review_requested(self, task_id: str, items: list[dict]):
+        """
+        Open modal dialog to review/edit subtitles; write edited content to .edited.srt files,
+        then emit subtitle_review_response with resulting file paths.
+        """
+        dlg = SubtitleReviewDialog(None, items)
+        res = dlg.exec()
+        updated_paths: list[Path] = []
+        if res == QDialog.DialogCode.Accepted:
+            for it, edited in zip(items, dlg.get_results()):
+                orig_path: Path = it.get("path")
+                orig_text: str = it.get("text") or ""
+                new_text: str = edited.get("text") or ""
+                try:
+                    if new_text != orig_text and orig_path:
+                        edited_path = orig_path.with_name(f"{orig_path.stem}.edited{orig_path.suffix}")
+                        edited_path.write_text(new_text, encoding="utf-8")
+                        updated_paths.append(edited_path)
+                    else:
+                        updated_paths.append(orig_path)
+                except Exception:
+                    updated_paths.append(orig_path)
+        else:
+            updated_paths = [it.get("path") for it in items if it.get("path")]
+        self.subtitle_review_response.emit(task_id, updated_paths)

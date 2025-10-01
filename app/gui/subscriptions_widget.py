@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QPushButton, QLabel,
                              QSplitter, QAbstractItemView, QHeaderView, QSpinBox,
                              QDialog, QDialogButtonBox, QLineEdit, QCheckBox, QFormLayout,
                              QSizePolicy, QMessageBox, QFileDialog, QInputDialog,
-                             QDoubleSpinBox)  # + QDoubleSpinBox
+                             QDoubleSpinBox)
 from PyQt6.QtCore import Qt, QSettings
 import os
 from pathlib import Path
@@ -92,6 +92,24 @@ class SplitOptionsDialog(QDialog):
         self.cut_tail_spin.setValue(int(defaults.get("cut_tail_seconds", 0)))
         form.addRow("Cut tail (s):", self.cut_tail_spin)
 
+        # New: subtitles controls
+        self.burn_subs_checkbox = QCheckBox("Burn subtitles")
+        self.burn_subs_checkbox.setChecked(bool(defaults.get("burn_subtitles", True)))
+        form.addRow(self.burn_subs_checkbox)
+        self.subtitle_langs_edit = QLineEdit()
+        langs_def = defaults.get("subtitle_langs", ["en", "vi"])
+        self.subtitle_langs_edit.setText(",".join(langs_def) if isinstance(langs_def, list) else str(langs_def))
+        self.subtitle_langs_edit.setPlaceholderText("Comma-separated (e.g. en)")
+        form.addRow("Subtitle languages:", self.subtitle_langs_edit)
+
+        # Overlay toggles
+        self.show_title_checkbox = QCheckBox("Show title overlay")
+        self.show_title_checkbox.setChecked(bool(defaults.get("show_title_overlay", True)))
+        form.addRow(self.show_title_checkbox)
+        self.show_part_checkbox = QCheckBox("Show part label")
+        self.show_part_checkbox.setChecked(bool(defaults.get("show_part_overlay", True)))
+        form.addRow(self.show_part_checkbox)
+
         # Enable/disable controls based on split checkbox
         def toggle(enabled):
             self.duration_spin.setEnabled(enabled)
@@ -131,6 +149,12 @@ class SplitOptionsDialog(QDialog):
         vals["cut_head_seconds"] = self.cut_head_spin.value()
         vals["cut_tail_seconds"] = self.cut_tail_spin.value()
         vals["speed_factor"] = float(self.speed_spin.value())
+        # NEW: subtitle options
+        vals["burn_subtitles"] = self.burn_subs_checkbox.isChecked()
+        spec = self.subtitle_langs_edit.text().strip() or "en"
+        vals["subtitle_langs"] = [p.strip() for p in spec.split(",") if p.strip()]
+        vals["show_title_overlay"] = self.show_title_checkbox.isChecked()
+        vals["show_part_overlay"] = self.show_part_checkbox.isChecked()
         return vals
 
 class SubscriptionsWidget(QWidget):
@@ -473,7 +497,11 @@ class SubscriptionsWidget(QWidget):
             download_dir=folder,
             cut_head_seconds=user_opts.get("cut_head_seconds", 0),
             cut_tail_seconds=user_opts.get("cut_tail_seconds", 0),
-            speed_factor=user_opts.get("speed_factor", 1.0)
+            speed_factor=user_opts.get("speed_factor", 1.0),
+            burn_subtitles=user_opts.get("burn_subtitles", True),
+            subtitle_langs=user_opts.get("subtitle_langs") or base_opts.get("subtitle_langs", ["en", "vi"]),
+            show_title_overlay=user_opts.get("show_title_overlay", base_opts.get("show_title_overlay", True)),
+            show_part_overlay=user_opts.get("show_part_overlay", base_opts.get("show_part_overlay", True)),
         )
         self.download_service.start_download(task.id)
         btn = self._download_buttons.get(video["url"])
